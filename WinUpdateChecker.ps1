@@ -6,6 +6,7 @@
     WinForms GUI that queries the Windows Update API (WUA COM) for update status,
     displays results color-coded in a DataGridView, and exports to CSV or HTML.
 .NOTES
+    Version: 1.0.0-beta.1
     Self-elevates at startup (installing updates requires Administrator).
     Remote scanning requires WinRM on the target.
 #>
@@ -172,8 +173,9 @@ $rowsJoined
 #region -- WinForms UI --------------------------------------------------------
 
 # -- Main Form --
+$script:AppVersion  = '1.0.0-beta.1'
 $form               = New-Object System.Windows.Forms.Form
-$form.Text          = 'Windows Update Checker'
+$form.Text          = "Windows Update Checker v$script:AppVersion"
 $form.Size          = New-Object System.Drawing.Size(900, 640)
 $form.MinimumSize   = New-Object System.Drawing.Size(700, 500)
 $form.StartPosition = 'CenterScreen'
