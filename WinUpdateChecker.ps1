@@ -6,8 +6,36 @@
     WinForms GUI that queries the Windows Update API (WUA COM) for update status,
     displays results color-coded in a DataGridView, and exports to CSV or HTML.
 .NOTES
-    Run as Administrator for best results. Remote scanning requires WinRM on the target.
+    Self-elevates at startup (installing updates requires Administrator).
+    Remote scanning requires WinRM on the target.
 #>
+
+param([switch]$NoElevate)   # -NoElevate: skip self-elevation (used by automated tests)
+
+#region -- Self-Elevation -------------------------------------------------------
+# Installing updates via the WUA API requires Administrator. Relaunch elevated
+# if needed; if the UAC prompt is declined, explain and exit.
+if (-not $NoElevate) {
+    $wid  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $prin = New-Object Security.Principal.WindowsPrincipal($wid)
+    if (-not $prin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        try {
+            Start-Process -FilePath "$PSHOME\powershell.exe" `
+                -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`"" `
+                -Verb RunAs -ErrorAction Stop | Out-Null
+        } catch {
+            Add-Type -AssemblyName System.Windows.Forms
+            [System.Windows.Forms.MessageBox]::Show(
+                ('Administrator rights are required to scan for and install updates.' +
+                 "`n`nThe application will now exit."),
+                'Windows Update Checker',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        }
+        exit
+    }
+}
+#endregion
 
 #region -- Imports ------------------------------------------------------------
 Add-Type -AssemblyName System.Windows.Forms
@@ -24,6 +52,8 @@ $script:RunningPS     = $null  # Fix 1 / Fix 12: active PowerShell instance
 $script:RunningRS     = $null  # Fix 1 / Fix 12: active Runspace instance
 $script:PollHandle    = $null  # Fix 1: IAsyncResult from BeginInvoke
 $script:PollTimer     = $null  # Fix 1 / Fix 12: System.Windows.Forms.Timer
+$script:ActiveOp      = $null  # 'Scan' | 'Install' | $null (mutual exclusion)
+$script:CanInstall    = $false # last scan was local + WUA (install permitted)
 #endregion
 
 #region -- Export Functions ---------------------------------------------------
@@ -301,7 +331,9 @@ $pnlFilter.Controls.AddRange(@($lblFilterStatus, $cmbStatus, $lblFilterSev, $cmb
 # -- DataGridView --
 $grid                         = New-Object System.Windows.Forms.DataGridView
 $grid.Dock                    = 'Fill'
-$grid.ReadOnly                = $true
+# Grid-level ReadOnly must be off so the Select checkbox column is editable;
+# every other column is set ReadOnly individually below.
+$grid.ReadOnly                = $false
 $grid.AllowUserToAddRows      = $false
 $grid.AllowUserToDeleteRows   = $false
 $grid.RowHeadersVisible       = $false
@@ -311,6 +343,15 @@ $grid.BackgroundColor         = [System.Drawing.Color]::White
 $grid.BorderStyle             = 'None'
 $grid.ColumnHeadersHeightSizeMode = 'AutoSize'
 $grid.Font                    = New-Object System.Drawing.Font('Segoe UI', 9)
+
+# Checkbox column FIRST (column 0) -- fixed width so the Title Fill column
+# sizing is unaffected
+$colSelect              = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+$colSelect.Name         = 'Select'
+$colSelect.HeaderText   = ''
+$colSelect.Width        = 40
+$colSelect.AutoSizeMode = 'None'
+$grid.Columns.Add($colSelect) | Out-Null
 
 $cols = @(
     @{ Name='KB';       Header='KB';        Width=90;  Fill=$false },
@@ -324,6 +365,7 @@ foreach ($c in $cols) {
     $col            = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $col.Name       = $c.Name
     $col.HeaderText = $c.Header
+    $col.ReadOnly   = $true
     if ($c.Fill) {
         $col.AutoSizeMode = 'Fill'
     } else {
@@ -332,6 +374,14 @@ foreach ($c in $cols) {
     }
     $grid.Columns.Add($col) | Out-Null
 }
+
+# Hidden column carrying the WUA UpdateID for each row (empty for WMI rows);
+# used to re-acquire the IUpdate COM objects at install time
+$colUid          = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colUid.Name     = 'UpdateID'
+$colUid.Visible  = $false
+$colUid.ReadOnly = $true
+$grid.Columns.Add($colUid) | Out-Null
 
 # -- Bottom Panel --
 $pnlBottom           = New-Object System.Windows.Forms.Panel
@@ -357,13 +407,28 @@ $btnClear.Text     = 'Clear'
 $btnClear.Location = New-Object System.Drawing.Point(226, 5)
 $btnClear.Size     = New-Object System.Drawing.Size(80, 28)
 
+$btnInstall           = New-Object System.Windows.Forms.Button
+$btnInstall.Text      = 'Install Selected'
+$btnInstall.Location  = New-Object System.Drawing.Point(314, 5)
+$btnInstall.Size      = New-Object System.Drawing.Size(130, 28)
+$btnInstall.Enabled   = $false
+$btnInstall.BackColor = [System.Drawing.Color]::FromArgb(16, 124, 16)
+$btnInstall.ForeColor = [System.Drawing.Color]::White
+$btnInstall.FlatStyle = 'Flat'
+
+# Tooltips do not show on disabled controls, so this only documents the
+# enabled state; the disabled-for-remote explanation goes in the status label.
+$toolTip = New-Object System.Windows.Forms.ToolTip
+$toolTip.SetToolTip($btnInstall,
+    'Download and install the checked missing updates on this machine (local scans only).')
+
 $lblStatus           = New-Object System.Windows.Forms.Label
 $lblStatus.Text      = 'Ready'
-$lblStatus.Location  = New-Object System.Drawing.Point(320, 10)
+$lblStatus.Location  = New-Object System.Drawing.Point(456, 10)
 $lblStatus.AutoSize  = $true
 $lblStatus.ForeColor = [System.Drawing.Color]::Gray
 
-$pnlBottom.Controls.AddRange(@($btnExportCsv, $btnExportHtml, $btnClear, $lblStatus))
+$pnlBottom.Controls.AddRange(@($btnExportCsv, $btnExportHtml, $btnClear, $btnInstall, $lblStatus))
 
 # -- Assemble Form --
 $form.Controls.AddRange(@($grid, $pnlBottom, $pnlFilter, $pnlError,
@@ -375,11 +440,42 @@ $form.Controls.AddRange(@($grid, $pnlBottom, $pnlFilter, $pnlError,
 
 function Update-Grid {
     # Fix 8: uses Get-FilteredResults (shared with exports)
+    # Note: rebuilding the rows resets any checked Select boxes (documented).
     $filtered = Get-FilteredResults
     $grid.Rows.Clear()
     foreach ($u in $filtered) {
-        $grid.Rows.Add($u.KB, $u.Title, $u.Status, $u.Severity, $u.Date, $u.SizeKB) | Out-Null
+        $idx = $grid.Rows.Add($false, $u.KB, $u.Title, $u.Status, $u.Severity,
+            $u.Date, $u.SizeKB, [string]$u.UpdateID)
+        # Only Missing updates with a WUA identity are installable
+        $installable = ($u.Status -eq 'Missing') -and
+            -not [string]::IsNullOrEmpty([string]$u.UpdateID)
+        if (-not $installable) {
+            $grid.Rows[$idx].Cells['Select'].ReadOnly = $true
+        }
     }
+    Update-InstallButton
+}
+
+function Get-CheckedUpdateIDs {
+    $ids = @()
+    foreach ($row in $grid.Rows) {
+        if ($row.Cells['Select'].Value -eq $true) {
+            $id = [string]$row.Cells['UpdateID'].Value
+            if ($id) { $ids += $id }
+        }
+    }
+    return ,$ids
+}
+
+function Update-InstallButton {
+    $checked = (Get-CheckedUpdateIDs).Count
+    $btnInstall.Text = if ($checked -gt 0) {
+        "Install Selected ($checked)"
+    } else {
+        'Install Selected'
+    }
+    $btnInstall.Enabled = ($null -eq $script:ActiveOp) -and
+        $script:CanInstall -and ($checked -gt 0)
 }
 
 function Show-Error {
@@ -416,8 +512,9 @@ function Update-Summary {
     }
 }
 
-function Stop-ScanCleanup {
-    # Fix 12: dispose runspace/PS/timer cleanly when scan aborts or form closes
+function Stop-AsyncCleanup {
+    # Fix 12: dispose runspace/PS/timer cleanly when the active background
+    # operation (scan or install) completes, aborts, or the form closes
     if ($null -ne $script:PollTimer) {
         $script:PollTimer.Stop()
         $script:PollTimer.Dispose()
@@ -434,6 +531,7 @@ function Stop-ScanCleanup {
         $script:RunningRS = $null
     }
     $script:PollHandle = $null
+    $script:ActiveOp   = $null
 }
 
 #endregion
@@ -460,12 +558,14 @@ $scanPollTick = {
         $hadErrors = $true
         $psErrors  = @($_)
     } finally {
-        Stop-ScanCleanup
+        Stop-AsyncCleanup
     }
 
     # Restore UI
     $pnlProgress.Visible = $false
     $btnScan.Enabled     = $true
+    $script:CanInstall   = $false   # set true only on local WUA success below
+    Update-InstallButton
 
     # Handle PowerShell stream-level errors
     if ($hadErrors -and ($null -eq $scanResult -or $scanResult.Count -eq 0)) {
@@ -518,13 +618,133 @@ $scanPollTick = {
         Hide-Error
     }
 
+    # Install is only possible after a local WUA scan (WMI rows carry no
+    # update identity; remote WUA install is blocked by Windows)
+    $script:CanInstall = (-not $res.IsRemote) -and (-not $res.IsPartial)
+
     Update-Summary
     Update-Grid
 
     $btnExportCsv.Enabled  = ($script:ScanResults.Count -gt 0)
     $btnExportHtml.Enabled = ($script:ScanResults.Count -gt 0)
     $countStr              = $script:ScanResults.Count
-    $lblStatus.Text        = "Scan complete - $countStr updates found."
+    if ($res.IsRemote) {
+        # Tooltips never show on disabled buttons, so explain here instead
+        $lblStatus.Text = "Scan complete - $countStr updates found. " +
+            'Install is unavailable for remote targets (planned for a future version).'
+    } else {
+        $lblStatus.Text = "Scan complete - $countStr updates found."
+    }
+}
+
+# Poll tick for the install operation; same structure as $scanPollTick.
+$installPollTick = {
+    if (-not $script:PollHandle.IsCompleted) { return }
+
+    $script:PollTimer.Stop()
+
+    $installResult = $null
+    $psErrors      = $null
+    $hadErrors     = $false
+    try {
+        $installResult = $script:RunningPS.EndInvoke($script:PollHandle)
+        $psErrors      = $script:RunningPS.Streams.Error
+        $hadErrors     = $script:RunningPS.HadErrors
+    } catch {
+        $hadErrors = $true
+        $psErrors  = @($_)
+    } finally {
+        Stop-AsyncCleanup
+    }
+
+    # Restore UI
+    $pnlProgress.Visible = $false
+    $btnScan.Enabled     = $true
+    Update-InstallButton
+
+    if ($hadErrors -and ($null -eq $installResult -or $installResult.Count -eq 0)) {
+        $errTxt = if ($psErrors -and $psErrors.Count -gt 0) {
+            $psErrors[0].ToString()
+        } else {
+            'Unknown error'
+        }
+        Show-Error "Install error: $errTxt"
+        $lblStatus.Text = 'Install failed.'
+        return
+    }
+
+    $res = if ($installResult -is [System.Collections.IList]) { $installResult[0] } else { $installResult }
+
+    if ($null -eq $res) {
+        Show-Error 'Install returned no data.'
+        $lblStatus.Text = 'Install failed.'
+        return
+    }
+
+    if ($res.ErrorKind) {
+        Show-Error "Install failed: $($res.ErrorMessage)"
+        $lblStatus.Text = 'Install failed.'
+        return
+    }
+
+    # Success path: tally outcomes and surface reboot state
+    $succeeded = @($res.Items | Where-Object { $_.Outcome -like 'Succeeded*' }).Count
+    $failed    = @($res.Items | Where-Object { $_.Outcome -notlike 'Succeeded*' }).Count
+    $skipped   = @($res.SkippedTitles).Count
+
+    $script:RebootPending = $script:RebootPending -or [bool]$res.RebootRequired
+    Update-Summary
+
+    if ($failed -gt 0) {
+        Show-Error "$failed of $($res.Items.Count) updates failed to install - see the results dialog."
+    } elseif ($res.RebootRequired) {
+        Show-Error 'Reboot required to complete installation.'
+    }
+    $lblStatus.Text = "Install complete: $succeeded succeeded, $failed failed, $skipped skipped."
+
+    # Build the results report
+    $lines = @("Install Results", ("-" * 60))
+    foreach ($item in $res.Items) {
+        $line = "$($item.Outcome.PadRight(22)) $($item.KB.PadRight(11)) $($item.Title)"
+        if ($item.Outcome -notlike 'Succeeded*') { $line += "  [HResult $($item.HResult)]" }
+        $lines += $line
+    }
+    foreach ($s in $res.SkippedTitles) { $lines += "Skipped                $s" }
+    if (@($res.NotFoundIDs).Count -gt 0) {
+        $lines += ''
+        $lines += "$(@($res.NotFoundIDs).Count) selected update(s) were no longer offered by Windows Update" +
+            ' (superseded, expired, or already installed) and were not processed.'
+    }
+    if ($res.RebootRequired) {
+        $lines += ''
+        $lines += 'A reboot is required to complete the installation. Updates may still' +
+            ' show as Missing until the machine restarts.'
+    }
+
+    $dlg                 = New-Object System.Windows.Forms.Form
+    $dlg.Text            = 'Install Results'
+    $dlg.Size            = New-Object System.Drawing.Size(640, 360)
+    $dlg.StartPosition   = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+
+    $txt          = New-Object System.Windows.Forms.RichTextBox
+    $txt.Dock     = 'Fill'
+    $txt.ReadOnly = $true
+    $txt.Font     = New-Object System.Drawing.Font('Consolas', 9)
+    $txt.Text     = $lines -join "`r`n"
+
+    $btnCloseDlg      = New-Object System.Windows.Forms.Button
+    $btnCloseDlg.Text = 'Close'
+    $btnCloseDlg.Dock = 'Bottom'
+    $btnCloseDlg.Add_Click({ $dlg.Close() })
+
+    $dlg.Controls.AddRange(@($txt, $btnCloseDlg))
+    $dlg.ShowDialog($form) | Out-Null
+
+    # Refresh the grid by re-running a local scan through the normal path
+    $rbLocal.Checked = $true
+    $btnScan.PerformClick()
 }
 
 #endregion
@@ -586,6 +806,7 @@ function Start-ScanAsync {
                     Date     = if ($u.LastDeploymentChangeTime) { $u.LastDeploymentChangeTime.ToString("yyyy-MM-dd") } else { "N/A" }
                     SizeKB   = [math]::Round($u.MaxDownloadSize / 1KB, 0)
                     Source   = "WUA"
+                    UpdateID = $u.Identity.UpdateID
                 }
             }
             return $updates
@@ -602,6 +823,7 @@ function Start-ScanAsync {
                     Date     = if ($_.InstalledOn) { $_.InstalledOn.ToString("yyyy-MM-dd") } else { "N/A" }
                     SizeKB   = 0
                     Source   = "WMI"
+                    UpdateID = ""
                 }
             }
         }
@@ -680,6 +902,7 @@ function Start-ScanAsync {
                                 Date     = if ($_.InstalledOn) { $_.InstalledOn.ToString("yyyy-MM-dd") } else { "N/A" }
                                 SizeKB   = 0
                                 Source   = "WMI"
+                                UpdateID = ""
                             }
                         }
                     }
@@ -755,6 +978,7 @@ function Start-ScanAsync {
     [void]$ps.AddArgument($Credential)
     [void]$ps.AddArgument($UseSSL)
 
+    $script:ActiveOp   = 'Scan'
     $script:RunningPS  = $ps
     $script:RunningRS  = $rs
     $script:PollHandle = $ps.BeginInvoke()
@@ -763,6 +987,117 @@ function Start-ScanAsync {
     $timer          = New-Object System.Windows.Forms.Timer
     $timer.Interval = 500
     $timer.Add_Tick($scanPollTick)
+    $script:PollTimer = $timer
+    $timer.Start()
+}
+
+function Start-InstallAsync {
+    param([string[]]$UpdateIDs)
+
+    # Background install script -- self-contained, same pattern as the scan.
+    # NOTE: single-quoted string; keep it free of apostrophes, inner strings
+    # double-quoted.
+    $bgScript = [scriptblock]::Create('
+        param($UpdateIDs)
+
+        $result = [PSCustomObject]@{
+            Items          = @()     # per-update: KB, Title, Outcome, HResult
+            SkippedTitles  = @()     # CanRequestUserInput or EULA failure
+            NotFoundIDs    = @()     # selected IDs no longer offered by WU
+            RebootRequired = $false
+            ErrorKind      = $null
+            ErrorMessage   = $null
+        }
+
+        try {
+            $session  = New-Object -ComObject Microsoft.Update.Session
+            $searcher = $session.CreateUpdateSearcher()
+            $searcher.Online = $true
+            $search = $searcher.Search("IsInstalled=0")
+
+            $toInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+            $found = @{}
+            foreach ($u in $search.Updates) {
+                $uid = $u.Identity.UpdateID
+                if ($UpdateIDs -contains $uid) {
+                    $found[$uid] = $true
+                    if ($u.InstallationBehavior.CanRequestUserInput) {
+                        $result.SkippedTitles += ($u.Title + " [requires user input]")
+                        continue
+                    }
+                    if (-not $u.EulaAccepted) {
+                        try { $u.AcceptEula() } catch {
+                            $result.SkippedTitles += ($u.Title + " [EULA could not be accepted]")
+                            continue
+                        }
+                    }
+                    [void]$toInstall.Add($u)
+                }
+            }
+            foreach ($id in $UpdateIDs) {
+                if (-not $found.ContainsKey($id)) { $result.NotFoundIDs += $id }
+            }
+
+            if ($toInstall.Count -eq 0) {
+                $result.ErrorKind    = "NOTHING_TO_INSTALL"
+                $result.ErrorMessage = "None of the selected updates are currently installable. Rescan and try again."
+                return $result
+            }
+
+            $downloader = $session.CreateUpdateDownloader()
+            $downloader.Updates = $toInstall
+            $dl = $downloader.Download()
+            if ($dl.ResultCode -ne 2 -and $dl.ResultCode -ne 3) {
+                $result.ErrorKind    = "DOWNLOAD_FAILED"
+                $result.ErrorMessage = ("Download failed - result code {0}, HResult 0x{1:X8}" -f $dl.ResultCode, $dl.HResult)
+                return $result
+            }
+
+            $installer = $session.CreateUpdateInstaller()
+            $installer.Updates = $toInstall
+            $inst = $installer.Install()
+            $result.RebootRequired = [bool]$inst.RebootRequired
+
+            for ($i = 0; $i -lt $toInstall.Count; $i++) {
+                $ur = $inst.GetUpdateResult($i)
+                if     ($ur.ResultCode -eq 2) { $outcome = "Succeeded" }
+                elseif ($ur.ResultCode -eq 3) { $outcome = "Succeeded with errors" }
+                elseif ($ur.ResultCode -eq 4) { $outcome = "Failed" }
+                elseif ($ur.ResultCode -eq 5) { $outcome = "Aborted" }
+                else                          { $outcome = "Unknown ($($ur.ResultCode))" }
+                $item = $toInstall.Item($i)
+                $kb = if ($item.KBArticleIDs.Count -gt 0) { "KB" + $item.KBArticleIDs[0] } else { "N/A" }
+                $result.Items += [PSCustomObject]@{
+                    KB      = $kb
+                    Title   = $item.Title
+                    Outcome = $outcome
+                    HResult = ("0x{0:X8}" -f $ur.HResult)
+                }
+            }
+        } catch {
+            $result.ErrorKind    = "INSTALL_FAILED"
+            $result.ErrorMessage = $_.ToString()
+        }
+        return $result
+    ')
+
+    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $rs.Open()
+
+    $ps          = [powershell]::Create()
+    $ps.Runspace = $rs
+
+    [void]$ps.AddScript($bgScript)
+    [void]$ps.AddArgument($UpdateIDs)
+
+    $script:ActiveOp   = 'Install'
+    $script:RunningPS  = $ps
+    $script:RunningRS  = $rs
+    $script:PollHandle = $ps.BeginInvoke()
+
+    $timer          = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 500
+    $timer.Add_Tick($installPollTick)
     $script:PollTimer = $timer
     $timer.Start()
 }
@@ -794,6 +1129,8 @@ $btnScan.Add_Click({
     $grid.Rows.Clear()
     $script:ScanResults   = @()
     $script:RebootPending = $false
+    $script:CanInstall    = $false
+    $btnInstall.Enabled    = $false
     $btnExportCsv.Enabled  = $false
     $btnExportHtml.Enabled = $false
     $lblInstalled.Text    = 'Installed: -'
@@ -831,21 +1168,43 @@ $btnScan.Add_Click({
 # Fix 10: color ENTIRE row background by status (not just the Status cell).
 # Uses if/elseif rather than switch: inside a switch block PowerShell rebinds
 # $_ to the switch input value, clobbering the CellFormatting event args.
+# Non-installable Select cells get a gray background instead; this must live
+# here (not as cell.Style in Update-Grid) or the repaint overwrites it.
 $grid.Add_CellFormatting({
     if ($_.RowIndex -ge 0) {
-        $statusVal = $grid.Rows[$_.RowIndex].Cells['Status'].Value
-        if ($statusVal -eq 'Installed') {
-            $_.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(230, 255, 230)
-        } elseif ($statusVal -eq 'Missing') {
-            $_.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 230, 230)
+        if ($grid.Columns[$_.ColumnIndex].Name -eq 'Select' -and
+            $grid.Rows[$_.RowIndex].Cells['Select'].ReadOnly) {
+            $_.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(225, 225, 225)
+        } else {
+            $statusVal = $grid.Rows[$_.RowIndex].Cells['Status'].Value
+            if ($statusVal -eq 'Installed') {
+                $_.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(230, 255, 230)
+            } elseif ($statusVal -eq 'Missing') {
+                $_.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 230, 230)
+            }
         }
+    }
+})
+
+# Commit checkbox toggles immediately (otherwise the value lands only when
+# the cell loses focus) so the Install button count stays live
+$grid.Add_CurrentCellDirtyStateChanged({
+    if ($grid.IsCurrentCellDirty -and
+        $grid.CurrentCell -is [System.Windows.Forms.DataGridViewCheckBoxCell]) {
+        $grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
+    }
+})
+
+$grid.Add_CellValueChanged({
+    if ($_.RowIndex -ge 0 -and $grid.Columns[$_.ColumnIndex].Name -eq 'Select') {
+        Update-InstallButton
     }
 })
 
 # Fix 9: KB URL construction uses anchored replace '^KB' so only the leading
 # "KB" prefix is stripped (e.g. "KB1234" -> "1234"), not all occurrences.
 $grid.Add_CellDoubleClick({
-    if ($_.RowIndex -ge 0) {
+    if ($_.RowIndex -ge 0 -and $grid.Columns[$_.ColumnIndex].Name -ne 'Select') {
         $rowKb     = $grid.Rows[$_.RowIndex].Cells['KB'].Value
         $rowTitle  = $grid.Rows[$_.RowIndex].Cells['Title'].Value
         $rowStatus = $grid.Rows[$_.RowIndex].Cells['Status'].Value
@@ -910,12 +1269,37 @@ $btnExportHtml.Add_Click({
     }
 })
 
+# Install Selected
+$btnInstall.Add_Click({
+    $ids = Get-CheckedUpdateIDs
+    if ($ids.Count -eq 0) {
+        Show-Error 'No installable updates are checked.'
+        return
+    }
+    $confirm = [System.Windows.Forms.MessageBox]::Show(
+        "Download and install $($ids.Count) update(s) on this machine?",
+        'Confirm Install',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+    Hide-Error
+    $btnScan.Enabled     = $false
+    $btnInstall.Enabled  = $false
+    $pnlProgress.Visible = $true
+    $lblStatus.Text      = "Downloading and installing $($ids.Count) update(s)... this can take several minutes."
+
+    Start-InstallAsync -UpdateIDs $ids
+})
+
 # Clear
 $btnClear.Add_Click({
     $grid.Rows.Clear()
     $script:ScanResults   = @()
     $script:RebootPending = $false
     $script:ScannedOS     = ''
+    $script:CanInstall    = $false
+    Update-InstallButton
     $btnExportCsv.Enabled  = $false
     $btnExportHtml.Enabled = $false
     $lblInstalled.Text    = 'Installed: -'
@@ -927,9 +1311,24 @@ $btnClear.Add_Click({
     Hide-Error
 })
 
-# Fix 12: clean up timer/runspace if the form closes during an active scan
+# Fix 12: clean up timer/runspace if the form closes during an active operation.
+# Closing mid-install gets a warning first: a synchronous WUA Install() cannot
+# be aborted promptly and killing it can leave the update agent busy.
 $form.Add_FormClosing({
-    Stop-ScanCleanup
+    if ($script:ActiveOp -eq 'Install') {
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            ('An update installation is in progress. Closing now will not roll it back' +
+             ' and may leave Windows Update busy until it finishes.' +
+             "`n`nClose anyway?"),
+            'Installation In Progress',
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+            $_.Cancel = $true
+            return
+        }
+    }
+    Stop-AsyncCleanup
 })
 
 #endregion
