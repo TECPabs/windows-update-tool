@@ -7,8 +7,8 @@ A portable PowerShell WinForms GUI tool for verifying Windows Update status on l
 - **Local & Remote scanning** — scan the local machine or any remote server by hostname/IP
 - **Windows Update API (WUA COM)** — authoritative source, same data as the Windows Update UI
 - **Fallback to WMI** — if WUA COM is unavailable, falls back to `Win32_QuickFixEngineering`
-- **Color-coded results** — green (Installed), red (Missing), orange (Pending Reboot)
-- **Filters** — filter by Status and Severity
+- **Color-coded results** — green (Installed), red (Missing), plus a separate Reboot Pending indicator
+- **Filters** — filter by Status and Severity (exports respect the active filters)
 - **Detail popup** — double-click any row for full update details + Microsoft KB link
 - **Export** — save results as CSV or self-contained HTML report
 
@@ -43,3 +43,4 @@ winrm quickconfig
 
 - Exported CSV and HTML files are excluded from Git via `.gitignore`
 - The WUA COM `Search()` call can take 30-120 seconds depending on the machine and network
+- **Remote scans show installed hotfixes only** — Windows does not allow the WUA API to be called remotely over WinRM, so remote results come from WMI and cannot include missing updates
