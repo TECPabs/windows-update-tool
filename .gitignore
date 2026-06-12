@@ -1,0 +1,11 @@
+# Exported reports
+*.csv
+*.html
+
+# PowerShell session files
+*.pssproj
+*.pssln
+
+# Temp files
+*.tmp
+*.log
