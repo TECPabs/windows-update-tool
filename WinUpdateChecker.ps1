@@ -12,6 +12,23 @@
 
 param([switch]$NoElevate)   # -NoElevate: skip self-elevation (used by automated tests)
 
+#region -- Hide Console Window --------------------------------------------------
+# Hide the PowerShell console that hosts this GUI -- but ONLY if this process
+# owns it (launched via double-click / "Run with PowerShell"). When started
+# from an existing terminal, more than one process is attached to the console
+# and hiding it would hide the user's terminal.
+Add-Type -Name ConsoleWin -Namespace Native -MemberDefinition '
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")]   public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[DllImport("kernel32.dll")] public static extern uint GetConsoleProcessList(uint[] processList, uint processCount);
+'
+# uint32, not uint: the uint accelerator does not exist on PowerShell 5.1
+$consoleProcs = New-Object uint32[] 2
+if ([Native.ConsoleWin]::GetConsoleProcessList($consoleProcs, 2) -le 1) {
+    [void][Native.ConsoleWin]::ShowWindow([Native.ConsoleWin]::GetConsoleWindow(), 0)  # 0 = SW_HIDE
+}
+#endregion
+
 #region -- Self-Elevation -------------------------------------------------------
 # Installing updates via the WUA API requires Administrator. Relaunch elevated
 # if needed; if the UAC prompt is declined, explain and exit.
@@ -21,7 +38,7 @@ if (-not $NoElevate) {
     if (-not $prin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         try {
             Start-Process -FilePath "$PSHOME\powershell.exe" `
-                -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`"" `
+                -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`"" `
                 -Verb RunAs -ErrorAction Stop | Out-Null
         } catch {
             Add-Type -AssemblyName System.Windows.Forms
