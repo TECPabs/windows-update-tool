@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Windows Update Verification Tool — checks installed vs missing updates locally or on a remote server.
+    Windows Update Verification Tool - checks installed vs missing updates locally or on a remote server.
 .DESCRIPTION
     WinForms GUI that queries the Windows Update API (WUA COM) for update status,
     displays results color-coded in a DataGridView, and exports to CSV or HTML.
@@ -155,7 +155,7 @@ function Export-ToHtml {
 <html>
 <head>
 <meta charset="UTF-8">
-<title>Windows Update Report — $TargetName</title>
+<title>Windows Update Report - $TargetName</title>
 <style>
   body { font-family: Segoe UI, Arial, sans-serif; margin: 20px; color: #222; }
   h1   { color: #0078d4; }
@@ -273,21 +273,21 @@ $pnlSummary.Padding    = New-Object System.Windows.Forms.Padding(10, 8, 10, 0)
 $pnlSummary.BackColor  = [System.Drawing.Color]::White
 
 $lblInstalled          = New-Object System.Windows.Forms.Label
-$lblInstalled.Text     = "Installed: —"
+$lblInstalled.Text     = "Installed: -"
 $lblInstalled.Location = New-Object System.Drawing.Point(10, 10)
 $lblInstalled.AutoSize = $true
 $lblInstalled.ForeColor= [System.Drawing.Color]::FromArgb(46, 125, 50)
 $lblInstalled.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 
 $lblMissing            = New-Object System.Windows.Forms.Label
-$lblMissing.Text       = "Missing: —"
+$lblMissing.Text       = "Missing: -"
 $lblMissing.Location   = New-Object System.Drawing.Point(160, 10)
 $lblMissing.AutoSize   = $true
 $lblMissing.ForeColor  = [System.Drawing.Color]::FromArgb(198, 40, 40)
 $lblMissing.Font       = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 
 $lblPending            = New-Object System.Windows.Forms.Label
-$lblPending.Text       = "Pending Reboot: —"
+$lblPending.Text       = "Pending Reboot: -"
 $lblPending.Location   = New-Object System.Drawing.Point(310, 10)
 $lblPending.AutoSize   = $true
 $lblPending.ForeColor  = [System.Drawing.Color]::FromArgb(230, 81, 0)
@@ -468,7 +468,7 @@ function Update-Summary {
     $lblMissing.Text   = "Missing: $missing"
     $lblPending.Text   = "Pending Reboot: $pending"
     $lblScanTime.Text  = "Last scan: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" +
-                         $(if ($script:IsPartialData) { "  [Partial data — WUA COM unavailable, showing WMI results]" } else { "" })
+                         $(if ($script:IsPartialData) { "  [Partial data - WUA COM unavailable, showing WMI results]" } else { "" })
 }
 
 #endregion
@@ -534,7 +534,7 @@ $bgWorker.Add_RunWorkerCompleted({
     if ($e.Error) {
         $msg = $e.Error.Message
         if ($msg -match "WinRM_UNREACHABLE:(.+)") {
-            Show-Error "WinRM unreachable on '$($Matches[1])' — enable it with: winrm quickconfig"
+            Show-Error "WinRM unreachable on '$($Matches[1])' - enable it with: winrm quickconfig"
         } elseif ($msg -match "SCAN_FAILED:(.+)") {
             Show-Error "Scan failed: $($Matches[1])"
         } else {
@@ -548,7 +548,7 @@ $bgWorker.Add_RunWorkerCompleted({
     $script:IsPartialData = $e.Result.IsPartial
 
     if ($script:IsPartialData) {
-        Show-Error "Partial data — WUA COM unavailable, showing WMI (Get-HotFix) results only."
+        Show-Error "Partial data - WUA COM unavailable, showing WMI (Get-HotFix) results only."
     } else {
         Hide-Error
     }
@@ -558,7 +558,7 @@ $bgWorker.Add_RunWorkerCompleted({
 
     $btnExportCsv.Enabled  = ($script:ScanResults.Count -gt 0)
     $btnExportHtml.Enabled = ($script:ScanResults.Count -gt 0)
-    $lblStatus.Text        = "Scan complete — $($script:ScanResults.Count) updates found."
+    $lblStatus.Text        = "Scan complete - $($script:ScanResults.Count) updates found."
 })
 
 #endregion
@@ -579,9 +579,9 @@ $btnScan.Add_Click({
     $script:ScanResults = @()
     $btnExportCsv.Enabled  = $false
     $btnExportHtml.Enabled = $false
-    $lblInstalled.Text = "Installed: —"
-    $lblMissing.Text   = "Missing: —"
-    $lblPending.Text   = "Pending Reboot: —"
+    $lblInstalled.Text = "Installed: -"
+    $lblMissing.Text   = "Missing: -"
+    $lblPending.Text   = "Pending Reboot: -"
     $lblScanTime.Text  = ""
 
     $isRemote = $rbRemote.Checked
@@ -631,7 +631,7 @@ $grid.Add_CellDoubleClick({
         $size  = $grid.Rows[$_.RowIndex].Cells['SizeKB'].Value
 
         $detail = New-Object System.Windows.Forms.Form
-        $detail.Text = "Update Detail — $kb"
+        $detail.Text = "Update Detail - $kb"
         $detail.Size = New-Object System.Drawing.Size(500, 280)
         $detail.StartPosition = "CenterParent"
         $detail.FormBorderStyle = "FixedDialog"
@@ -688,9 +688,9 @@ $btnClear.Add_Click({
     $script:ScanResults    = @()
     $btnExportCsv.Enabled  = $false
     $btnExportHtml.Enabled = $false
-    $lblInstalled.Text     = "Installed: —"
-    $lblMissing.Text       = "Missing: —"
-    $lblPending.Text       = "Pending Reboot: —"
+    $lblInstalled.Text     = "Installed: -"
+    $lblMissing.Text       = "Missing: -"
+    $lblPending.Text       = "Pending Reboot: -"
     $lblScanTime.Text      = ""
     $lblStatus.Text        = "Ready"
     Hide-Error
