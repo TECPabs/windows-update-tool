@@ -828,13 +828,16 @@ $btnScan.Add_Click({
     Start-ScanAsync -Target $target -IsRemote $isRemote -Credential $cred -UseSSL $false
 })
 
-# Fix 10: color ENTIRE row background by status (not just the Status cell)
+# Fix 10: color ENTIRE row background by status (not just the Status cell).
+# Uses if/elseif rather than switch: inside a switch block PowerShell rebinds
+# $_ to the switch input value, clobbering the CellFormatting event args.
 $grid.Add_CellFormatting({
     if ($_.RowIndex -ge 0) {
         $statusVal = $grid.Rows[$_.RowIndex].Cells['Status'].Value
-        switch ($statusVal) {
-            'Installed' { $_.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(230, 255, 230) }
-            'Missing'   { $_.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 230, 230) }
+        if ($statusVal -eq 'Installed') {
+            $_.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(230, 255, 230)
+        } elseif ($statusVal -eq 'Missing') {
+            $_.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 230, 230)
         }
     }
 })
