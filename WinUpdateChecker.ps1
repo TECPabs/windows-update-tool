@@ -138,6 +138,10 @@ $pnlTarget.Dock      = 'Top'
 $pnlTarget.Height    = 80
 $pnlTarget.Padding   = New-Object System.Windows.Forms.Padding(10, 8, 10, 0)
 $pnlTarget.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+# Size the panel to the form's client width BEFORE adding the right-anchored
+# Scan button: anchor offsets are captured against the panel's width at add
+# time (default 200px), which would otherwise push the button off-screen.
+$pnlTarget.Width     = $form.ClientSize.Width
 
 $lblTarget          = New-Object System.Windows.Forms.Label
 $lblTarget.Text     = 'Target:'
