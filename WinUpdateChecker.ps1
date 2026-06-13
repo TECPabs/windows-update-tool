@@ -79,6 +79,7 @@ $script:CanInstall      = $false # last scan succeeded (local WUA or remote SYST
 $script:LastWasRemote   = $false
 $script:LastTarget      = ''
 $script:LastCredential  = $null
+$script:LastCredTarget  = ''    # target the cached credential was entered for (reuse key)
 $script:LastUseSSL      = $false
 $script:LastErrorText   = ''    # full text of the last error (for the details dialog)
 #endregion
@@ -897,6 +898,12 @@ $scanPollTick = {
     if ($res.ErrorKind -eq 'SCAN_FAILED') {
         Show-Error "Scan failed: $($res.ErrorMessage)"
         $lblStatus.Text = 'Scan failed.'
+        # If the failure looks credential-related, drop the cached credential so
+        # the next scan re-prompts instead of silently reusing bad credentials.
+        if ($res.ErrorMessage -match 'Access is denied|logon|authentication|user name or password|password is incorrect|credential') {
+            $script:LastCredential = $null
+            $script:LastCredTarget = ''
+        }
         return
     }
 
@@ -1737,8 +1744,15 @@ $btnScan.Add_Click({
     $cred = $null
     if ($rbCreds.Checked) {
         $credTarget = if ($isRemote) { $target } else { 'local scan' }
-        $cred = Get-Credential -Message "Enter credentials for $credTarget"
-        if (-not $cred) { return }
+        if ($script:LastCredential -and $script:LastCredTarget -eq $credTarget) {
+            # Reuse the credential already entered for this target this session
+            # (so install + the post-install auto-rescan don't re-prompt).
+            $cred = $script:LastCredential
+        } else {
+            $cred = Get-Credential -Message "Enter credentials for $credTarget"
+            if (-not $cred) { return }
+            $script:LastCredTarget = $credTarget
+        }
     }
 
     # Plan item 9: capture effective transport for later install
@@ -1910,6 +1924,9 @@ $btnClear.Add_Click({
     $script:RebootPending = $false
     $script:ScannedOS     = ''
     $script:CanInstall    = $false
+    # Forget any cached credential so the next scan prompts fresh
+    $script:LastCredential = $null
+    $script:LastCredTarget = ''
     Update-InstallButton
     $btnExportCsv.Enabled  = $false
     $btnExportHtml.Enabled = $false
