@@ -1742,7 +1742,7 @@ $btnScan.Add_Click({
     }
 
     $cred = $null
-    if ($rbCreds.Checked) {
+    if ($rbCreds.Checked -and $rbCreds.Enabled) {
         $credTarget = if ($isRemote) { $target } else { 'local scan' }
         if ($script:LastCredential -and $script:LastCredTarget -eq $credTarget) {
             # Reuse the credential already entered for this target this session
