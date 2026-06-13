@@ -1,0 +1,83 @@
+# Windows Update Checker — Project Roadmap
+
+A portable PowerShell 5.1 WinForms tool for scanning, installing, and managing Windows updates on local and remote machines. This document tracks where the project is and where it's going.
+
+_Last updated: 2026-06-13 — current release: **v1.0.0-beta.3**_
+
+## Current state (shipped)
+
+- **Local & remote scanning** via the Windows Update Agent (WUA), with a WMI fallback.
+- **Install missing updates** on local or remote machines.
+- **Remote reboot** with a 60s warning/abort countdown, down-then-up wait, and auto-rescan.
+- Remote operations run WUA locally on the target via a one-shot **SYSTEM scheduled task** (the supported way around Windows' block on remote update API calls).
+- Per-target **credential caching** (sign in once), color-coded results, status/severity filters, detail popup, CSV/HTML export, self-elevation.
+
+## Design principles (keep future work consistent)
+
+- **Portable**: a single `.ps1` script — no external modules or installers. Any persisted config (e.g. exclusion lists, logs) should be optional sibling files, not a required dependency.
+- **Windows PowerShell 5.1 / .NET Framework** compatible.
+- **Async via runspace + WinForms Timer**; background scripts are self-contained `[scriptblock]::Create('...')` literals (no apostrophes inside). `$script:ActiveOp` enforces mutual exclusion.
+- **Remote = WinRM**, reusing the existing transport/credential/SSL plumbing and the SYSTEM-scheduled-task mechanism.
+- Destructive/disruptive actions get explicit confirmation.
+
+---
+
+## Planned features
+
+### 1. Fleet / multi-target operations  _(largest lift; highest value)_
+
+Move from one-machine-at-a-time to managing many machines at once — the core MSP use case.
+
+**Scope**
+- **Target input**: multiline list / comma-separated, plus **CSV import**; later, optional Active Directory OU query.
+- **Per-machine results view**: a master grid of machines (Target · Status · Installed/Missing counts · Reboot Pending · last result/error), with drill-down into a single machine's update grid (the current view becomes the detail view).
+- **Batch actions**: scan / install-selected / reboot across selected machines.
+- **Parallel execution** via a runspace pool with a concurrency cap; the existing single-target worker becomes the per-machine unit of work.
+- **Error isolation**: one machine failing must not abort the batch; surface per-machine errors.
+
+**Design considerations**
+- Biggest architectural change (single-target GUI → fleet). Suggest phasing: **Phase A** sequential multi-target with the master grid; **Phase B** parallel execution.
+- Mutual-exclusion model changes (N concurrent ops); credential caching is already per-target.
+- Aggregate progress/status reporting.
+
+### 4. Update selectivity  _(medium; mostly additive)_
+
+More control over *which* updates install, instead of "all missing."
+
+**Scope**
+- Select/filter by **severity** (Critical/Important/Moderate/Low) and **category** (Security, Critical, Driver, Definition, Optional/Preview).
+- Quick action: **install Critical/Security only**, skip drivers/optional.
+- **KB exclusion / block list** (persisted) — never install specified KBs (e.g. known-bad updates).
+- **Dry-run / preview** of what would be installed.
+
+**Design considerations**
+- Capture update **category** in the scan result object (currently we capture severity but not category); WUA exposes `Categories`, `MsrcSeverity`, `BrowseOnly` (optional), `IsMandatory`.
+- Exclusion list needs persistence — an optional sibling `.json` config (keep the portable-single-file principle: absent file = no exclusions).
+- Largely independent of feature #1 — can ship first.
+
+### 5. Audit logging & multi-machine reporting  _(logging is small; reporting builds on #1)_
+
+A compliance trail and client-facing reports.
+
+**Scope**
+- **Audit log**: append-only, timestamped log of actions (scan / install / reboot, target, result, outcome) in a structured + human-readable format.
+- **Consolidated report**: extend the existing HTML/CSV export to cover **multiple machines** — a patch-compliance summary suitable to hand to a client.
+
+**Design considerations**
+- Log location: optional sibling file (portable); consider simple rotation; decide log verbosity.
+- The multi-machine report depends on feature #1's data model; the **per-action audit log is independent and can ship early**.
+- Reuse and extend `Export-ToHtml`.
+
+---
+
+## Suggested sequencing
+
+1. **Update selectivity (#4)** and the **per-action audit log (part of #5)** — independent, additive, ship-able without the big refactor.
+2. **Fleet / multi-target (#1)** — the major architectural step (phase sequential, then parallel).
+3. **Multi-machine reporting (rest of #5)** — rides on the fleet data model from #1.
+
+## Considered but deferred
+
+- **ConnectWise Manage integration** — auto-post patch notes/time entries to the matching configuration or open/update a ticket. High workflow value given the MSP context; revisit after fleet support exists.
+- **Scheduling & unattended mode** — a headless `-Unattended -Target -Install -Reboot` mode for off-hours maintenance windows via Task Scheduler, with email/report on completion.
+- **Polish**: real per-update download/install progress (vs. marquee), pre-reboot "who's logged on" check, WSUS-vs-Microsoft-Update source selection, disk-space pre-check.
