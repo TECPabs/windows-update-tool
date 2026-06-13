@@ -8,8 +8,11 @@
     Remote scanning and installation use a SYSTEM-context scheduled task on the target
     via CIM (no WinRM required for the scan itself; WinRM is used only to read back
     the result JSON and clean up).
+    Remote Reboot: after a successful remote scan the user can schedule a forced reboot
+    (shutdown.exe /r /f /t 60) on the target via WinRM/Invoke-Command, with countdown,
+    abort, and auto-rescan after the target comes back online.
 .NOTES
-    Version: 1.0.0-beta.2
+    Version: 1.0.0-beta.3
     Self-elevates at startup (installing updates requires Administrator).
     Remote scanning/installation requires WinRM on the target for result retrieval.
 #>
@@ -75,6 +78,15 @@ $script:PollHandle      = $null  # Fix 1: IAsyncResult from BeginInvoke
 $script:PollTimer       = $null  # Fix 1 / Fix 12: System.Windows.Forms.Timer
 $script:ActiveOp        = $null  # 'Scan' | 'Install' | $null (mutual exclusion)
 $script:CanInstall      = $false # last scan succeeded (local WUA or remote SYSTEM-task WUA)
+# Remote Reboot state machine
+$script:CanReboot            = $false   # true only after a successful remote scan
+$script:RebootPhase          = 'Idle'   # 'Idle' | 'Countdown' | 'Waiting'
+$script:RebootMode           = $null    # 'Issue' | 'Abort' | 'Wait'  -- which bg op is running
+$script:RebootCountdown      = 0        # seconds remaining in countdown
+$script:RebootTimer          = $null    # System.Windows.Forms.Timer for 1-second countdown
+$script:RebootWaitStart      = $null    # [datetime] when the Waiting phase began
+$script:RebootDelaySec       = 60       # shutdown /t value (seconds before reboot)
+$script:RebootWaitTimeoutSec = 1800     # 30-minute poll timeout
 # Remote transport state -- stored at scan-launch; reused by Install
 $script:LastWasRemote   = $false
 $script:LastTarget      = ''
@@ -185,7 +197,7 @@ $rowsJoined
 #region -- WinForms UI --------------------------------------------------------
 
 # -- Main Form --
-$script:AppVersion  = '1.0.0-beta.2'
+$script:AppVersion  = '1.0.0-beta.3'
 $form               = New-Object System.Windows.Forms.Form
 $form.Text          = "Windows Update Checker v$script:AppVersion"
 $form.Size          = New-Object System.Drawing.Size(900, 640)
@@ -486,18 +498,31 @@ $btnInstall.BackColor = [System.Drawing.Color]::FromArgb(16, 124, 16)
 $btnInstall.ForeColor = [System.Drawing.Color]::White
 $btnInstall.FlatStyle = 'Flat'
 
+# Reboot Remote button -- destructive styling; enabled only after a successful remote scan
+$btnReboot           = New-Object System.Windows.Forms.Button
+$btnReboot.Text      = 'Reboot Remote'
+$btnReboot.Location  = New-Object System.Drawing.Point(452, 5)
+$btnReboot.Size      = New-Object System.Drawing.Size(130, 28)
+$btnReboot.Enabled   = $false
+$btnReboot.BackColor = [System.Drawing.Color]::FromArgb(180, 30, 30)
+$btnReboot.ForeColor = [System.Drawing.Color]::White
+$btnReboot.FlatStyle = 'Flat'
+$btnReboot.Font      = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+
 # Tooltip for the Install button (plan item 11: dropped "(local scans only)")
 $toolTip = New-Object System.Windows.Forms.ToolTip
 $toolTip.SetToolTip($btnInstall,
     'Download and install the checked missing updates on the target machine.')
+$toolTip.SetToolTip($btnReboot,
+    'Schedule a forced reboot of the remote target (60-second delay, force-close apps).')
 
 $lblStatus           = New-Object System.Windows.Forms.Label
 $lblStatus.Text      = 'Ready'
-$lblStatus.Location  = New-Object System.Drawing.Point(456, 10)
+$lblStatus.Location  = New-Object System.Drawing.Point(594, 10)
 $lblStatus.AutoSize  = $true
 $lblStatus.ForeColor = [System.Drawing.Color]::Gray
 
-$pnlBottom.Controls.AddRange(@($btnExportCsv, $btnExportHtml, $btnClear, $btnInstall, $lblStatus))
+$pnlBottom.Controls.AddRange(@($btnExportCsv, $btnExportHtml, $btnClear, $btnInstall, $btnReboot, $lblStatus))
 
 # -- Assemble Form --
 $form.Controls.AddRange(@($grid, $pnlBottom, $pnlFilter, $pnlError,
@@ -523,6 +548,7 @@ function Update-Grid {
         }
     }
     Update-InstallButton
+    Update-RebootButton
 }
 
 function Get-CheckedUpdateIDs {
@@ -545,6 +571,32 @@ function Update-InstallButton {
     }
     $btnInstall.Enabled = ($null -eq $script:ActiveOp) -and
         $script:CanInstall -and ($checked -gt 0)
+}
+
+function Update-RebootButton {
+    # Only governs Idle baseline; Countdown/Waiting phases set button text/enabled explicitly.
+    if ($script:RebootPhase -ne 'Idle') { return }
+    $btnReboot.Text    = 'Reboot Remote'
+    $btnReboot.Enabled = ($null -eq $script:ActiveOp) -and
+                         $script:CanReboot -and
+                         $script:LastWasRemote
+}
+
+function Reset-RebootState {
+    # Stop and dispose the countdown timer, then return all reboot state to Idle.
+    # Called from: Abort-done, Stop-Waiting click, Wait-done, error paths.
+    if ($null -ne $script:RebootTimer) {
+        $script:RebootTimer.Stop()
+        $script:RebootTimer.Dispose()
+        $script:RebootTimer = $null
+    }
+    $script:RebootPhase  = 'Idle'
+    $script:RebootMode   = $null
+    $script:ActiveOp     = $null
+    $btnScan.Enabled     = $true
+    $pnlProgress.Visible = $false
+    Update-InstallButton
+    Update-RebootButton
 }
 
 function Show-Error {
@@ -636,10 +688,13 @@ function Update-Summary {
 }
 
 function Stop-AsyncCleanup {
-    # Fix 12: dispose runspace/PS/timer cleanly when the active background
-    # operation (scan or install) completes, aborts, or the form closes.
+    # Fix 12: dispose runspace/PS/poll-timer cleanly when the active background
+    # operation (scan, install, or reboot sub-op) completes, aborts, or the form closes.
     # NOTE: Stop-AsyncCleanup intentionally does NOT abort a detached remote
     # SYSTEM scheduled task -- orphan-cleanup-on-connect is the safety net.
+    # NOTE: Stop-AsyncCleanup does NOT touch $script:RebootTimer or $script:RebootPhase;
+    # those are managed exclusively by Reset-RebootState so that entering the Countdown
+    # phase (after the Issue op's finally block runs this cleanup) leaves the countdown intact.
     if ($null -ne $script:PollTimer) {
         $script:PollTimer.Stop()
         $script:PollTimer.Dispose()
@@ -656,7 +711,10 @@ function Stop-AsyncCleanup {
         $script:RunningRS = $null
     }
     $script:PollHandle = $null
-    $script:ActiveOp   = $null
+    # Clear ActiveOp unconditionally. For Scan/Install this returns the mutex to idle.
+    # For Reboot ops: the reboot tick handler re-asserts ActiveOp='Reboot' immediately
+    # after calling this (before any other UI-thread code can run), so clearing here is safe.
+    $script:ActiveOp = $null
 }
 
 #endregion
@@ -866,7 +924,9 @@ $scanPollTick = {
     $pnlProgress.Visible = $false
     $btnScan.Enabled     = $true
     $script:CanInstall   = $false
+    $script:CanReboot    = $false
     Update-InstallButton
+    Update-RebootButton
 
     # Handle PowerShell stream-level errors
     if ($hadErrors -and ($null -eq $scanResult -or $scanResult.Count -eq 0)) {
@@ -917,6 +977,8 @@ $scanPollTick = {
 
     # Plan item 7a: CanInstall is true for any non-partial scan (local or remote full WUA)
     $script:CanInstall = (-not $res.IsPartial) -and ($null -eq $res.ErrorKind)
+    # CanReboot: enabled for any successful remote scan (even partial WMI-only), no error
+    $script:CanReboot  = [bool]$res.IsRemote -and ($null -eq $res.ErrorKind)
 
     # Plan item 7b/7c: banner logic
     if ($script:IsPartialData -and (-not $res.IsRemote)) {
@@ -934,7 +996,7 @@ $scanPollTick = {
     }
 
     Update-Summary
-    Update-Grid
+    Update-Grid    # calls Update-InstallButton and Update-RebootButton
 
     $btnExportCsv.Enabled  = ($script:ScanResults.Count -gt 0)
     $btnExportHtml.Enabled = ($script:ScanResults.Count -gt 0)
@@ -968,6 +1030,7 @@ $installPollTick = {
     $pnlProgress.Visible = $false
     $btnScan.Enabled     = $true
     Update-InstallButton
+    Update-RebootButton
 
     if ($hadErrors -and ($null -eq $installResult -or $installResult.Count -eq 0)) {
         $errTxt = if ($psErrors -and $psErrors.Count -gt 0) {
@@ -1693,6 +1756,352 @@ function Start-InstallAsync {
     $timer.Start()
 }
 
+# ---------------------------------------------------------------------------
+# Reboot poll-tick handler (UI-thread; polls background reboot sub-ops)
+# ---------------------------------------------------------------------------
+$rebootPollTick = {
+    # Elapsed status update for Wait mode -- do this BEFORE the early-return so
+    # the user sees progress even though the bg op has not completed yet.
+    if ($script:RebootMode -eq 'Wait' -and $null -ne $script:RebootWaitStart) {
+        $elapsedSec = [int]([datetime]::Now - $script:RebootWaitStart).TotalSeconds
+        $lblStatus.Text = "Waiting for $($script:LastTarget) to come back online... ($($elapsedSec)s elapsed)"
+    }
+
+    if (-not $script:PollHandle.IsCompleted) { return }
+
+    $script:PollTimer.Stop()
+
+    $rebootResult = $null
+    $psErrors     = $null
+    $hadErrors    = $false
+    $capturedMode = $script:RebootMode   # capture before cleanup clears it
+    try {
+        $rebootResult = $script:RunningPS.EndInvoke($script:PollHandle)
+        $psErrors     = $script:RunningPS.Streams.Error
+        $hadErrors    = $script:RunningPS.HadErrors
+    } catch {
+        $hadErrors = $true
+        $psErrors  = @($_)
+    } finally {
+        Stop-AsyncCleanup   # disposes PS/RS/PollTimer; does NOT touch RebootTimer/RebootPhase
+    }
+
+    $res = if ($rebootResult -is [System.Collections.IList]) { $rebootResult[0] } else { $rebootResult }
+
+    if ($capturedMode -eq 'Issue') {
+        # ---- Issue done ----
+        if ($hadErrors -and ($null -eq $res -or $res.Ok -ne $true)) {
+            $errTxt = if ($psErrors -and $psErrors.Count -gt 0) {
+                $psErrors[0].ToString()
+            } else {
+                'Unknown error launching remote reboot.'
+            }
+            Show-Error "Reboot error: $errTxt"
+            $lblStatus.Text = 'Remote reboot failed.'
+            # Drop cached cred if auth-related
+            if ($errTxt -match 'Access is denied|logon|authentication|user name or password|password is incorrect|credential') {
+                $script:LastCredential = $null
+                $script:LastCredTarget = ''
+            }
+            Reset-RebootState
+            return
+        }
+
+        if ($null -eq $res -or $res.ErrorKind) {
+            $ek = if ($res) { $res.ErrorKind } else { 'null result' }
+            $em = if ($res) { $res.ErrorMessage } else { 'No result from reboot operation.' }
+            if ($ek -eq 'UNREACHABLE') {
+                Show-Error "Cannot reach $($script:LastTarget) to schedule reboot - WinRM unreachable."
+            } else {
+                Show-Error "Reboot failed ($ek): $em"
+            }
+            $lblStatus.Text = 'Remote reboot failed.'
+            Reset-RebootState
+            return
+        }
+
+        # Success -- enter COUNTDOWN phase
+        $script:RebootPhase     = 'Countdown'
+        $script:RebootCountdown = $script:RebootDelaySec
+        $script:ActiveOp        = 'Reboot'   # re-assert after Stop-AsyncCleanup
+        $btnReboot.Text         = 'Abort Reboot'
+        $btnReboot.Enabled      = $true
+        $btnScan.Enabled        = $false
+        $btnInstall.Enabled     = $false
+        $lblStatus.Text         = "Rebooting $($script:LastTarget) in $($script:RebootCountdown)s - click Abort to cancel"
+
+        $cTimer          = New-Object System.Windows.Forms.Timer
+        $cTimer.Interval = 1000
+        $cTimer.Add_Tick($rebootCountdownTick)
+        $script:RebootTimer = $cTimer
+        $cTimer.Start()
+
+    } elseif ($capturedMode -eq 'Abort') {
+        # ---- Abort done ----
+        $lblStatus.Text = 'Reboot aborted.'
+        Reset-RebootState
+
+    } elseif ($capturedMode -eq 'Wait') {
+        # ---- Wait done ----
+        if ($null -ne $res -and $res.Back -eq $true) {
+            $lblStatus.Text = "$($script:LastTarget) back online - re-scanning..."
+            Reset-RebootState
+            $btnScan.PerformClick()
+        } elseif ($null -ne $res -and $res.TimedOut -eq $true) {
+            $lblStatus.Text = "Timed out waiting for $($script:LastTarget); re-scan manually when it is back."
+            Reset-RebootState
+        } else {
+            $errTxt = if ($null -ne $res -and $res.ErrorMessage) { $res.ErrorMessage } else { 'Unknown wait error.' }
+            Show-Error "Wait error: $errTxt"
+            $lblStatus.Text = "Error waiting for $($script:LastTarget); re-scan manually."
+            Reset-RebootState
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Reboot countdown tick handler (1-second timer; decrements countdown)
+# ---------------------------------------------------------------------------
+$rebootCountdownTick = {
+    $script:RebootCountdown--
+    if ($script:RebootCountdown -gt 0) {
+        $lblStatus.Text = "Rebooting $($script:LastTarget) in $($script:RebootCountdown)s - click Abort to cancel"
+        return
+    }
+
+    # Countdown reached zero -- server is now rebooting
+    $script:RebootTimer.Stop()
+    $script:RebootTimer.Dispose()
+    $script:RebootTimer = $null
+
+    $script:RebootPhase    = 'Waiting'
+    $script:RebootWaitStart = [datetime]::Now
+    $btnReboot.Text        = 'Stop Waiting'
+    $btnReboot.Enabled     = $true
+    $lblStatus.Text        = "Waiting for $($script:LastTarget) to come back online... (0s elapsed)"
+
+    Start-RebootOpAsync -Mode 'Wait' `
+        -Target     $script:LastTarget `
+        -Credential $script:LastCredential `
+        -UseSSL     $script:LastUseSSL `
+        -TimeoutSec $script:RebootWaitTimeoutSec
+}
+
+function Start-RebootOpAsync {
+    param(
+        [string]  $Mode,       # 'Issue' | 'Abort' | 'Wait'
+        [string]  $Target,
+        [System.Management.Automation.PSCredential]$Credential,
+        [bool]    $UseSSL,
+        [int]     $DelaySec  = 60,
+        [string]  $Message   = '',
+        [int]     $TimeoutSec = 1800
+    )
+
+    # ------------------------------------------------------------------
+    # Background scriptblocks -- single-quoted [scriptblock]::Create('...')
+    # NO apostrophes anywhere inside; all inner strings use double-quotes.
+    # ------------------------------------------------------------------
+
+    if ($Mode -eq 'Issue') {
+        # Build shutdown command string (no apostrophes, no stray chars)
+        $shutdownMsg = if ($Message -ne '') { $Message } else {
+            "WinUpdateChecker: System reboot scheduled by administrator. Save your work now."
+        }
+        # We pass DelaySec and shutdownMsg as arguments to keep the bgScript clean.
+        $bgScript = [scriptblock]::Create('
+            param($Target, $Credential, $UseSSL, $DelaySec, $ShutdownMsg)
+
+            $result = [PSCustomObject]@{ Ok=$false; ErrorKind=$null; ErrorMessage=$null }
+
+            $icParams = @{ ComputerName=$Target; ErrorAction="Stop" }
+            if ($Credential) { $icParams.Credential = $Credential }
+            if ($UseSSL)     { $icParams.UseSSL     = $true }
+
+            # Optional reachability probe
+            $port5985 = $false
+            $port5986 = $false
+            try {
+                $t = Test-NetConnection -ComputerName $Target -Port 5985 -WarningAction SilentlyContinue -ErrorAction Stop
+                $port5985 = $t.TcpTestSucceeded
+            } catch { $port5985 = $false }
+            if (-not $port5985) {
+                try {
+                    $t = Test-NetConnection -ComputerName $Target -Port 5986 -WarningAction SilentlyContinue -ErrorAction Stop
+                    $port5986 = $t.TcpTestSucceeded
+                } catch { $port5986 = $false }
+            }
+            if (-not $port5985 -and -not $port5986) {
+                $result.ErrorKind    = "UNREACHABLE"
+                $result.ErrorMessage = "WinRM not reachable on $Target (ports 5985/5986)"
+                return $result
+            }
+
+            try {
+                $shutdownCmd = "shutdown.exe /r /f /t " + $DelaySec + " /c """ + $ShutdownMsg + """"
+                $icParams.ScriptBlock = [scriptblock]::Create($shutdownCmd)
+                Invoke-Command @icParams | Out-Null
+                $result.Ok = $true
+            } catch {
+                $errStr = $_.ToString()
+                # A connection-terminated exception after /t 60 is effectively success
+                # (shutdown.exe returned 0 and the session dropped) -- classify as ok.
+                if ($errStr -match "pipeline has been stopped|The pipeline was stopped|connection.*reset|forcibly closed|network path was not found") {
+                    $result.Ok = $true
+                } else {
+                    $result.ErrorKind    = "REBOOT_FAILED"
+                    $result.ErrorMessage = $errStr
+                }
+            }
+            return $result
+        ')
+
+        $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $rs.Open()
+        $ps          = [powershell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript($bgScript)
+        [void]$ps.AddArgument($Target)
+        [void]$ps.AddArgument($Credential)
+        [void]$ps.AddArgument($UseSSL)
+        [void]$ps.AddArgument($DelaySec)
+        [void]$ps.AddArgument($shutdownMsg)
+
+        $script:ActiveOp   = 'Reboot'
+        $script:RebootMode = 'Issue'
+        $script:RunningPS  = $ps
+        $script:RunningRS  = $rs
+        $script:PollHandle = $ps.BeginInvoke()
+
+        $timer          = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 500
+        $timer.Add_Tick($rebootPollTick)
+        $script:PollTimer = $timer
+        $timer.Start()
+
+    } elseif ($Mode -eq 'Abort') {
+        $bgScript = [scriptblock]::Create('
+            param($Target, $Credential, $UseSSL)
+
+            $result = [PSCustomObject]@{ Ok=$false; ErrorKind=$null; ErrorMessage=$null }
+
+            $icParams = @{ ComputerName=$Target; ErrorAction="Stop" }
+            if ($Credential) { $icParams.Credential = $Credential }
+            if ($UseSSL)     { $icParams.UseSSL     = $true }
+
+            try {
+                $icParams.ScriptBlock = [scriptblock]::Create("shutdown.exe /a")
+                Invoke-Command @icParams | Out-Null
+                $result.Ok = $true
+            } catch {
+                # "no shutdown was in progress" is exit code 1116; treat as ok-enough
+                $result.Ok = $true
+            }
+            return $result
+        ')
+
+        $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $rs.Open()
+        $ps          = [powershell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript($bgScript)
+        [void]$ps.AddArgument($Target)
+        [void]$ps.AddArgument($Credential)
+        [void]$ps.AddArgument($UseSSL)
+
+        $script:ActiveOp   = 'Reboot'
+        $script:RebootMode = 'Abort'
+        $script:RunningPS  = $ps
+        $script:RunningRS  = $rs
+        $script:PollHandle = $ps.BeginInvoke()
+
+        $timer          = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 500
+        $timer.Add_Tick($rebootPollTick)
+        $script:PollTimer = $timer
+        $timer.Start()
+
+    } elseif ($Mode -eq 'Wait') {
+        $bgScript = [scriptblock]::Create('
+            param($Target, $Credential, $UseSSL, $TimeoutSec)
+
+            $result = [PSCustomObject]@{ Back=$false; TimedOut=$false; ErrorKind=$null; ErrorMessage=$null }
+
+            $deadline = (Get-Date).AddSeconds($TimeoutSec)
+
+            # Phase 1: wait until target stops responding (confirm it actually went down).
+            # We poll on a 5-second interval for up to the full deadline.
+            # We MUST observe the target offline before we can report it came back.
+            # (Without this gate, a still-up target would be mis-reported as "Back" once
+            # Phase 2 probes it and finds it reachable.)
+            $wentDown = $false
+            while ((Get-Date) -lt $deadline) {
+                Start-Sleep -Seconds 5
+                $up = $false
+                try {
+                    $t = Test-NetConnection -ComputerName $Target -Port 5985 -WarningAction SilentlyContinue -ErrorAction Stop
+                    $up = $t.TcpTestSucceeded
+                } catch { $up = $false }
+                if (-not $up) {
+                    try {
+                        $t = Test-NetConnection -ComputerName $Target -Port 5986 -WarningAction SilentlyContinue -ErrorAction Stop
+                        $up = $t.TcpTestSucceeded
+                    } catch { $up = $false }
+                }
+                if (-not $up) { $wentDown = $true; break }
+            }
+
+            # If the target never went offline before the deadline, it never actually rebooted.
+            if (-not $wentDown) {
+                $result.TimedOut = $true
+                return $result
+            }
+
+            # Phase 2: target confirmed offline; wait until it responds again
+            while ((Get-Date) -lt $deadline) {
+                Start-Sleep -Seconds 8
+                $up = $false
+                try {
+                    $t = Test-NetConnection -ComputerName $Target -Port 5985 -WarningAction SilentlyContinue -ErrorAction Stop
+                    $up = $t.TcpTestSucceeded
+                } catch { $up = $false }
+                if (-not $up) {
+                    try {
+                        $t = Test-NetConnection -ComputerName $Target -Port 5986 -WarningAction SilentlyContinue -ErrorAction Stop
+                        $up = $t.TcpTestSucceeded
+                    } catch { $up = $false }
+                }
+                if ($up) { $result.Back = $true; return $result }
+            }
+
+            $result.TimedOut = $true
+            return $result
+        ')
+
+        $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $rs.Open()
+        $ps          = [powershell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript($bgScript)
+        [void]$ps.AddArgument($Target)
+        [void]$ps.AddArgument($Credential)
+        [void]$ps.AddArgument($UseSSL)
+        [void]$ps.AddArgument($TimeoutSec)
+
+        $script:ActiveOp   = 'Reboot'
+        $script:RebootMode = 'Wait'
+        $script:RunningPS  = $ps
+        $script:RunningRS  = $rs
+        $script:PollHandle = $ps.BeginInvoke()
+
+        $timer          = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 2000   # poll every 2s for elapsed-status updates
+        $timer.Add_Tick($rebootPollTick)
+        $script:PollTimer = $timer
+        $timer.Start()
+    }
+}
+
 #endregion
 
 #region -- Event Handlers -----------------------------------------------------
@@ -1724,6 +2133,8 @@ $btnScan.Add_Click({
     $script:ScanResults   = @()
     $script:RebootPending = $false
     $script:CanInstall    = $false
+    $script:CanReboot     = $false
+    Update-RebootButton
     $btnInstall.Enabled    = $false
     $btnExportCsv.Enabled  = $false
     $btnExportHtml.Enabled = $false
@@ -1917,6 +2328,67 @@ $btnInstall.Add_Click({
         -InstallWorkerSrc $script:RemoteInstallWorkerSrc
 })
 
+# Reboot Remote button -- three-phase click handler (if/elseif; NEVER switch in handler)
+$btnReboot.Add_Click({
+    if ($script:RebootPhase -eq 'Idle') {
+        # Guard: must be remote
+        if (-not $script:LastWasRemote) { return }
+
+        $confirmMsg = (
+            "You are about to schedule a FORCED REBOOT of $($script:LastTarget)." +
+            "`r`n`r`n" +
+            "- The reboot will occur in $($script:RebootDelaySec) seconds." + "`r`n" +
+            "- All applications on the remote server will be force-closed." + "`r`n" +
+            "- Any unsaved work on that server may be lost." + "`r`n" +
+            "- This tool will wait for $($script:LastTarget) to come back online and then re-scan automatically." +
+            "`r`n`r`n" +
+            "Proceed?"
+        )
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            $confirmMsg,
+            "Confirm Remote Reboot - $($script:LastTarget)",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        Hide-Error
+        $btnScan.Enabled    = $false
+        $btnInstall.Enabled = $false
+        $btnReboot.Enabled  = $false
+        $lblStatus.Text     = "Scheduling reboot on $($script:LastTarget)..."
+
+        $rebootWarning = "WinUpdateChecker: System reboot scheduled by administrator. Save your work now. Rebooting in $($script:RebootDelaySec) seconds."
+
+        Start-RebootOpAsync -Mode 'Issue' `
+            -Target     $script:LastTarget `
+            -Credential $script:LastCredential `
+            -UseSSL     $script:LastUseSSL `
+            -DelaySec   $script:RebootDelaySec `
+            -Message    $rebootWarning
+
+    } elseif ($script:RebootPhase -eq 'Countdown') {
+        # Abort the scheduled reboot
+        if ($null -ne $script:RebootTimer) {
+            $script:RebootTimer.Stop()
+            $script:RebootTimer.Dispose()
+            $script:RebootTimer = $null
+        }
+        $btnReboot.Enabled = $false
+        $lblStatus.Text    = "Aborting reboot on $($script:LastTarget)..."
+
+        Start-RebootOpAsync -Mode 'Abort' `
+            -Target     $script:LastTarget `
+            -Credential $script:LastCredential `
+            -UseSSL     $script:LastUseSSL
+
+    } elseif ($script:RebootPhase -eq 'Waiting') {
+        # Stop waiting -- the reboot is committed; user will re-scan manually
+        Stop-AsyncCleanup   # clears ActiveOp, disposes bg runspace/PS/PollTimer
+        $lblStatus.Text = "Stopped waiting - re-scan manually when $($script:LastTarget) is back."
+        Reset-RebootState   # stops RebootTimer (none in Wait), phase=Idle, re-enables controls
+    }
+})
+
 # Clear
 $btnClear.Add_Click({
     $grid.Rows.Clear()
@@ -1924,10 +2396,12 @@ $btnClear.Add_Click({
     $script:RebootPending = $false
     $script:ScannedOS     = ''
     $script:CanInstall    = $false
+    $script:CanReboot     = $false
     # Forget any cached credential so the next scan prompts fresh
     $script:LastCredential = $null
     $script:LastCredTarget = ''
     Update-InstallButton
+    Update-RebootButton
     $btnExportCsv.Enabled  = $false
     $btnExportHtml.Enabled = $false
     $lblInstalled.Text    = 'Installed: -'
@@ -1946,6 +2420,31 @@ $btnClear.Add_Click({
 # Note: if a remote SYSTEM task is running, it will continue on the target;
 # orphan-cleanup-on-next-connect is the safety net for that scenario.
 $form.Add_FormClosing({
+    # Reboot Countdown: reboot is already scheduled; closing won't cancel it
+    if ($script:RebootPhase -eq 'Countdown') {
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            ("A reboot of $($script:LastTarget) has been scheduled and will occur in approximately " +
+             "$($script:RebootCountdown) seconds. CLOSING THIS APP WILL NOT CANCEL IT." +
+             "`r`n`r`nTo cancel the reboot, click 'No' and then click 'Abort Reboot'." +
+             "`r`n`r`nClose anyway (the scheduled reboot on $($script:LastTarget) will proceed)?"),
+            'Reboot Scheduled - Closing Will Not Cancel',
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+            $_.Cancel = $true
+            return
+        }
+    }
+    # Reboot Waiting: safe to close; inform and proceed
+    if ($script:RebootPhase -eq 'Waiting') {
+        [System.Windows.Forms.MessageBox]::Show(
+            ("$($script:LastTarget) is rebooting. Closing this app will stop the " +
+             "online check but will not affect the reboot." +
+             "`r`n`r`nRe-scan manually once the server is back online."),
+            'Waiting for Server - Closing',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    }
     if ($script:ActiveOp -eq 'Install') {
         $remoteNote = if ($script:LastWasRemote) {
             " Note: the remote install task on $($script:LastTarget) will continue running until it finishes."
@@ -1964,6 +2463,12 @@ $form.Add_FormClosing({
             $_.Cancel = $true
             return
         }
+    }
+    # Clean up reboot timer if still running
+    if ($null -ne $script:RebootTimer) {
+        $script:RebootTimer.Stop()
+        $script:RebootTimer.Dispose()
+        $script:RebootTimer = $null
     }
     Stop-AsyncCleanup
 })
