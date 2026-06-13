@@ -5,10 +5,13 @@
 .DESCRIPTION
     WinForms GUI that queries the Windows Update API (WUA COM) for update status,
     displays results color-coded in a DataGridView, and exports to CSV or HTML.
+    Remote scanning and installation use a SYSTEM-context scheduled task on the target
+    via CIM (no WinRM required for the scan itself; WinRM is used only to read back
+    the result JSON and clean up).
 .NOTES
-    Version: 1.0.0-beta.1
+    Version: 1.0.0-beta.2
     Self-elevates at startup (installing updates requires Administrator).
-    Remote scanning requires WinRM on the target.
+    Remote scanning/installation requires WinRM on the target for result retrieval.
 #>
 
 param([switch]$NoElevate)   # -NoElevate: skip self-elevation (used by automated tests)
@@ -62,16 +65,21 @@ Add-Type -AssemblyName System.Drawing
 #endregion
 
 #region -- Shared Script State ------------------------------------------------
-$script:ScanResults   = @()
-$script:IsPartialData = $false
-$script:RebootPending = $false
-$script:ScannedOS     = ''     # Fix 11: captured from target during scan
-$script:RunningPS     = $null  # Fix 1 / Fix 12: active PowerShell instance
-$script:RunningRS     = $null  # Fix 1 / Fix 12: active Runspace instance
-$script:PollHandle    = $null  # Fix 1: IAsyncResult from BeginInvoke
-$script:PollTimer     = $null  # Fix 1 / Fix 12: System.Windows.Forms.Timer
-$script:ActiveOp      = $null  # 'Scan' | 'Install' | $null (mutual exclusion)
-$script:CanInstall    = $false # last scan was local + WUA (install permitted)
+$script:ScanResults     = @()
+$script:IsPartialData   = $false
+$script:RebootPending   = $false
+$script:ScannedOS       = ''     # Fix 11: captured from target during scan
+$script:RunningPS       = $null  # Fix 1 / Fix 12: active PowerShell instance
+$script:RunningRS       = $null  # Fix 1 / Fix 12: active Runspace instance
+$script:PollHandle      = $null  # Fix 1: IAsyncResult from BeginInvoke
+$script:PollTimer       = $null  # Fix 1 / Fix 12: System.Windows.Forms.Timer
+$script:ActiveOp        = $null  # 'Scan' | 'Install' | $null (mutual exclusion)
+$script:CanInstall      = $false # last scan succeeded (local WUA or remote SYSTEM-task WUA)
+# Remote transport state -- stored at scan-launch; reused by Install
+$script:LastWasRemote   = $false
+$script:LastTarget      = ''
+$script:LastCredential  = $null
+$script:LastUseSSL      = $false
 #endregion
 
 #region -- Export Functions ---------------------------------------------------
@@ -112,10 +120,12 @@ function Export-ToHtml {
     $safeOS     = [System.Net.WebUtility]::HtmlEncode($OSVersion)
 
     $rows = $Records | ForEach-Object {
-        $color = switch ($_.Status) {
-            'Installed' { '#e6ffe6' }
-            'Missing'   { '#ffe6e6' }
-            default     { '#ffffff' }
+        $color = if ($_.Status -eq 'Installed') {
+            '#e6ffe6'
+        } elseif ($_.Status -eq 'Missing') {
+            '#ffe6e6'
+        } else {
+            '#ffffff'
         }
         # Fix 7: encode per-row values
         $safeKB     = [System.Net.WebUtility]::HtmlEncode([string]$_.KB)
@@ -173,7 +183,7 @@ $rowsJoined
 #region -- WinForms UI --------------------------------------------------------
 
 # -- Main Form --
-$script:AppVersion  = '1.0.0-beta.1'
+$script:AppVersion  = '1.0.0-beta.2'
 $form               = New-Object System.Windows.Forms.Form
 $form.Text          = "Windows Update Checker v$script:AppVersion"
 $form.Size          = New-Object System.Drawing.Size(900, 640)
@@ -329,7 +339,7 @@ $cmbStatus                = New-Object System.Windows.Forms.ComboBox
 $cmbStatus.Location       = New-Object System.Drawing.Point(55, 4)
 $cmbStatus.Width          = 130
 $cmbStatus.DropDownStyle  = 'DropDownList'
-# Fix 6: removed 'Pending Reboot' from filter — that status no longer appears on rows
+# Fix 6: removed 'Pending Reboot' from filter - that status no longer appears on rows
 $cmbStatus.Items.AddRange(@('All', 'Installed', 'Missing'))
 $cmbStatus.SelectedIndex  = 0
 
@@ -435,11 +445,10 @@ $btnInstall.BackColor = [System.Drawing.Color]::FromArgb(16, 124, 16)
 $btnInstall.ForeColor = [System.Drawing.Color]::White
 $btnInstall.FlatStyle = 'Flat'
 
-# Tooltips do not show on disabled controls, so this only documents the
-# enabled state; the disabled-for-remote explanation goes in the status label.
+# Tooltip for the Install button (plan item 11: dropped "(local scans only)")
 $toolTip = New-Object System.Windows.Forms.ToolTip
 $toolTip.SetToolTip($btnInstall,
-    'Download and install the checked missing updates on this machine (local scans only).')
+    'Download and install the checked missing updates on the target machine.')
 
 $lblStatus           = New-Object System.Windows.Forms.Label
 $lblStatus.Text      = 'Ready'
@@ -533,7 +542,9 @@ function Update-Summary {
 
 function Stop-AsyncCleanup {
     # Fix 12: dispose runspace/PS/timer cleanly when the active background
-    # operation (scan or install) completes, aborts, or the form closes
+    # operation (scan or install) completes, aborts, or the form closes.
+    # NOTE: Stop-AsyncCleanup intentionally does NOT abort a detached remote
+    # SYSTEM scheduled task -- orphan-cleanup-on-connect is the safety net.
     if ($null -ne $script:PollTimer) {
         $script:PollTimer.Stop()
         $script:PollTimer.Dispose()
@@ -552,6 +563,182 @@ function Stop-AsyncCleanup {
     $script:PollHandle = $null
     $script:ActiveOp   = $null
 }
+
+#endregion
+
+#region -- Remote SYSTEM-Task Engine ------------------------------------------
+#
+# Worker source strings used by Invoke-RemoteSystemTask (defined inside each
+# background scriptblock -- runspaces cannot see main-scope vars).
+# Rules: single-quoted outer string means NO apostrophes anywhere inside;
+# all inner strings must use double-quotes.  Placeholder tokens are replaced
+# before Base64-encoding.
+#
+# $script:RemoteScanWorkerSrc  -- runs on the remote machine as SYSTEM
+# $script:RemoteInstallWorkerSrc -- runs on the remote machine as SYSTEM
+
+$script:RemoteScanWorkerSrc = '
+$resultPath = "__RESULTPATH__"
+$out = [PSCustomObject]@{
+    Updates         = @()
+    IsPartial       = $false
+    RebootPending   = $false
+    OSVersion       = "Unknown"
+    WuaSearchFailed = $false
+    WuaSearchError  = ""
+    ErrorKind       = $null
+    ErrorMessage    = $null
+}
+try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    if ($os) { $out.OSVersion = $os.Caption }
+
+    $wuaOk = $false
+    try {
+        $session  = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        $searcher.Online = $true
+        $sr = $searcher.Search("IsInstalled=0 OR IsInstalled=1")
+        $updates = @()
+        foreach ($u in $sr.Updates) {
+            $kb = if ($u.KBArticleIDs.Count -gt 0) { "KB" + $u.KBArticleIDs[0] } else { "N/A" }
+            $uid = ""
+            try { $uid = $u.Identity.UpdateID } catch {}
+            $updates += [PSCustomObject]@{
+                KB       = $kb
+                Title    = $u.Title
+                Status   = if ($u.IsInstalled) { "Installed" } else { "Missing" }
+                Severity = if ($u.MsrcSeverity) { $u.MsrcSeverity } else { "N/A" }
+                Date     = if ($u.LastDeploymentChangeTime) { $u.LastDeploymentChangeTime.ToString("yyyy-MM-dd") } else { "N/A" }
+                SizeKB   = [math]::Round($u.MaxDownloadSize / 1KB, 0)
+                Source   = "WUA"
+                UpdateID = $uid
+            }
+        }
+        $out.Updates = $updates
+        $wuaOk = $true
+    } catch {
+        $out.WuaSearchFailed = $true
+        $out.WuaSearchError  = $_.ToString()
+    }
+
+    if (-not $wuaOk) {
+        $out.IsPartial = $true
+        $hf = Get-CimInstance -ClassName Win32_QuickFixEngineering -ErrorAction Stop
+        $out.Updates = @($hf | ForEach-Object {
+            [PSCustomObject]@{
+                KB       = $_.HotFixID
+                Title    = $_.Description
+                Status   = "Installed"
+                Severity = "N/A"
+                Date     = if ($_.InstalledOn) { $_.InstalledOn.ToString("yyyy-MM-dd") } else { "N/A" }
+                SizeKB   = 0
+                Source   = "WMI"
+                UpdateID = ""
+            }
+        })
+    }
+
+    $keys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+    )
+    $pr = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" `
+        -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+    foreach ($k in $keys) { if (Test-Path $k) { $out.RebootPending = $true } }
+    if ($pr) { $out.RebootPending = $true }
+} catch {
+    $out.ErrorKind    = "SCAN_FAILED"
+    $out.ErrorMessage = $_.ToString()
+}
+$out | ConvertTo-Json -Depth 5 | Out-File -FilePath $resultPath -Encoding UTF8 -Force
+'
+
+$script:RemoteInstallWorkerSrc = '
+$resultPath = "__RESULTPATH__"
+$UpdateIDs  = @(__UPDATEIDS__)
+$out = [PSCustomObject]@{
+    Items          = @()
+    SkippedTitles  = @()
+    NotFoundIDs    = @()
+    RebootRequired = $false
+    ErrorKind      = $null
+    ErrorMessage   = $null
+}
+try {
+    $session  = New-Object -ComObject Microsoft.Update.Session
+    $searcher = $session.CreateUpdateSearcher()
+    $searcher.Online = $true
+    $search = $searcher.Search("IsInstalled=0")
+
+    $toInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+    $found = @{}
+    foreach ($u in $search.Updates) {
+        $uid = ""
+        try { $uid = $u.Identity.UpdateID } catch {}
+        if ($UpdateIDs -contains $uid) {
+            $found[$uid] = $true
+            if ($u.InstallationBehavior.CanRequestUserInput) {
+                $out.SkippedTitles += ($u.Title + " [requires user input]")
+                continue
+            }
+            if (-not $u.EulaAccepted) {
+                try { $u.AcceptEula() } catch {
+                    $out.SkippedTitles += ($u.Title + " [EULA could not be accepted]")
+                    continue
+                }
+            }
+            [void]$toInstall.Add($u)
+        }
+    }
+    foreach ($id in $UpdateIDs) {
+        if (-not $found.ContainsKey($id)) { $out.NotFoundIDs += $id }
+    }
+
+    if ($toInstall.Count -eq 0) {
+        $out.ErrorKind    = "NOTHING_TO_INSTALL"
+        $out.ErrorMessage = "None of the selected updates are currently installable. Rescan and try again."
+        $out | ConvertTo-Json -Depth 5 | Out-File -FilePath $resultPath -Encoding UTF8 -Force
+        return
+    }
+
+    $downloader = $session.CreateUpdateDownloader()
+    $downloader.Updates = $toInstall
+    $dl = $downloader.Download()
+    if ($dl.ResultCode -ne 2 -and $dl.ResultCode -ne 3) {
+        $out.ErrorKind    = "DOWNLOAD_FAILED"
+        $out.ErrorMessage = ("Download failed - result code {0}, HResult 0x{1:X8}" -f $dl.ResultCode, $dl.HResult)
+        $out | ConvertTo-Json -Depth 5 | Out-File -FilePath $resultPath -Encoding UTF8 -Force
+        return
+    }
+
+    $installer = $session.CreateUpdateInstaller()
+    $installer.Updates = $toInstall
+    $inst = $installer.Install()
+    $out.RebootRequired = [bool]$inst.RebootRequired
+
+    for ($i = 0; $i -lt $toInstall.Count; $i++) {
+        $ur = $inst.GetUpdateResult($i)
+        if     ($ur.ResultCode -eq 2) { $outcome = "Succeeded" }
+        elseif ($ur.ResultCode -eq 3) { $outcome = "Succeeded with errors" }
+        elseif ($ur.ResultCode -eq 4) { $outcome = "Failed" }
+        elseif ($ur.ResultCode -eq 5) { $outcome = "Aborted" }
+        else                          { $outcome = "Unknown ($($ur.ResultCode))" }
+        $item = $toInstall.Item($i)
+        $kb = if ($item.KBArticleIDs.Count -gt 0) { "KB" + $item.KBArticleIDs[0] } else { "N/A" }
+        $out.Items += [PSCustomObject]@{
+            KB      = $kb
+            Title   = $item.Title
+            Outcome = $outcome
+            HResult = ("0x{0:X8}" -f $ur.HResult)
+        }
+    }
+} catch {
+    $out.ErrorKind    = "INSTALL_FAILED"
+    $out.ErrorMessage = $_.ToString()
+}
+$out | ConvertTo-Json -Depth 5 | Out-File -FilePath $resultPath -Encoding UTF8 -Force
+'
 
 #endregion
 
@@ -583,7 +770,7 @@ $scanPollTick = {
     # Restore UI
     $pnlProgress.Visible = $false
     $btnScan.Enabled     = $true
-    $script:CanInstall   = $false   # set true only on local WUA success below
+    $script:CanInstall   = $false
     Update-InstallButton
 
     # Handle PowerShell stream-level errors
@@ -620,40 +807,40 @@ $scanPollTick = {
     }
 
     # Success path
-    $script:ScanResults   = $res.Updates
-    $script:IsPartialData = $res.IsPartial
-    $script:RebootPending = $res.RebootPending
-    $script:ScannedOS     = $res.OSVersion   # Fix 11: store target OS for HTML export
+    $script:ScanResults   = @($res.Updates)
+    $script:IsPartialData = [bool]$res.IsPartial
+    $script:RebootPending = [bool]$res.RebootPending
+    $script:ScannedOS     = $res.OSVersion
+    # Fix SSL: store the SSL flag actually used during scan so install reuses it correctly
+    if ($res.IsRemote) { $script:LastUseSSL = [bool]$res.EffectiveUseSSL }
 
-    # Fix 3: banner for WMI-only results
+    # Plan item 7a: CanInstall is true for any non-partial scan (local or remote full WUA)
+    $script:CanInstall = (-not $res.IsPartial) -and ($null -eq $res.ErrorKind)
+
+    # Plan item 7b/7c: banner logic
     if ($script:IsPartialData -and (-not $res.IsRemote)) {
         # Local scan fell back to WMI
         Show-Error 'WUA COM unavailable locally - showing installed hotfixes from WMI only.'
-    } elseif ($script:IsPartialData) {
-        # Remote scan always uses WMI (Fix 3: clear explanation)
-        Show-Error ('Remote WUA scanning is not supported by Windows (access denied over WinRM) ' +
-            '- showing installed hotfixes from WMI only; missing updates cannot be detected remotely.')
+    } elseif ($script:IsPartialData -and $res.IsRemote) {
+        # Plan item 7b: remote partial - rewording to not say WUA over WinRM is impossible
+        $bannerMsg = 'Accurate WUA scan unavailable on the remote target (Task Scheduler/agent path failed) - showing installed hotfixes from WMI only.'
+        if ([bool]$res.WuaSearchFailed) {
+            $bannerMsg += ' The remote machine ran the scan but Windows Update returned an error (commonly a per-user proxy or unreachable WSUS under the SYSTEM account).'
+        }
+        Show-Error $bannerMsg
     } else {
         Hide-Error
     }
-
-    # Install is only possible after a local WUA scan (WMI rows carry no
-    # update identity; remote WUA install is blocked by Windows)
-    $script:CanInstall = (-not $res.IsRemote) -and (-not $res.IsPartial)
 
     Update-Summary
     Update-Grid
 
     $btnExportCsv.Enabled  = ($script:ScanResults.Count -gt 0)
     $btnExportHtml.Enabled = ($script:ScanResults.Count -gt 0)
-    $countStr              = $script:ScanResults.Count
-    if ($res.IsRemote) {
-        # Tooltips never show on disabled buttons, so explain here instead
-        $lblStatus.Text = "Scan complete - $countStr updates found. " +
-            'Install is unavailable for remote targets (planned for a future version).'
-    } else {
-        $lblStatus.Text = "Scan complete - $countStr updates found."
-    }
+    $countStr = $script:ScanResults.Count
+
+    # Plan item 7c: remove the "Install is unavailable for remote targets" message
+    $lblStatus.Text = "Scan complete - $countStr updates found."
 }
 
 # Poll tick for the install operation; same structure as $scanPollTick.
@@ -761,8 +948,8 @@ $installPollTick = {
     $dlg.Controls.AddRange(@($txt, $btnCloseDlg))
     $dlg.ShowDialog($form) | Out-Null
 
-    # Refresh the grid by re-running a local scan through the normal path
-    $rbLocal.Checked = $true
+    # Plan item 8: auto-rescan uses PerformClick so it rescans whatever target
+    # (local or remote) is currently selected -- do NOT force $rbLocal.Checked
     $btnScan.PerformClick()
 }
 
@@ -776,24 +963,142 @@ $installPollTick = {
 # from the main script scope.  A WinForms Timer polls the IAsyncResult on the
 # UI thread (no cross-thread UI access).
 #
-# Fix 3: Remote WUA fallback banner explains WUA-over-WinRM is access-denied.
-# Fix 5: Probes 5985 then 5986; threads UseSSL through Invoke-Command.
-# Fix 6: RebootPending returned as a separate flag; row Status is not modified.
-# Fix 11: OSVersion gathered from target and returned in result object.
+# Remote path: Invoke-RemoteSystemTask is defined INSIDE the scriptblock
+# (duplicate body) so the background runspace can call it.  It registers a
+# SYSTEM scheduled task on the target via CIM, waits for completion, reads
+# back a JSON result file over Invoke-Command (WinRM), and cleans up.
 
 function Start-ScanAsync {
     param(
         [string]  $Target,
         [bool]    $IsRemote,
         [System.Management.Automation.PSCredential]$Credential,
-        [bool]    $UseSSL
+        [bool]    $UseSSL,
+        [string]  $ScanWorkerSrc,
+        [string]  $InstallWorkerSrc
     )
 
     # Background script -- entirely self-contained; no access to main scope.
+    # Single-quoted: NO apostrophes inside; all inner strings use double-quotes.
     $bgScript = [scriptblock]::Create('
-        param($Target, $IsRemote, $Credential, $UseSSL)
+        param($Target, $IsRemote, $Credential, $UseSSL, $ScanWorkerSrc, $InstallWorkerSrc)
 
-        #-- inner helpers: must be defined here ---------------------
+        #-- Invoke-RemoteSystemTask: registers+runs+polls+reads a SYSTEM task --
+        # This function body is duplicated in the install bgScript (runspaces
+        # cannot see main-scope functions).
+        function Invoke-RemoteSystemTask {
+            param(
+                [string]$Target,
+                [System.Management.Automation.PSCredential]$Credential,
+                [bool]$UseSSL,
+                [string]$Mode,
+                [string]$WorkerSrc,
+                [string[]]$UpdateIDs,
+                [int]$TimeoutSec
+            )
+
+            $cimOpts   = $null
+            $cimSess   = $null
+            $icParams  = @{ ComputerName = $Target; ErrorAction = "Stop" }
+
+            try {
+                if ($UseSSL) {
+                    $cimOpts = New-CimSessionOption -UseSsl
+                }
+                $cimSessParams = @{ ComputerName = $Target; ErrorAction = "Stop" }
+                if ($Credential) { $cimSessParams.Credential = $Credential }
+                if ($UseSSL)     { $cimSessParams.SessionOption = $cimOpts }
+                $cimSess = New-CimSession @cimSessParams
+
+                if ($Credential) { $icParams.Credential = $Credential }
+                if ($UseSSL)     { $icParams.UseSSL     = $true }
+
+                # Generate unique names
+                $guid     = [guid]::NewGuid().ToString("N")
+                $taskName = "WinUpdateChecker_" + $Mode + "_" + $guid
+                $resPath  = "C:\Windows\Temp\WUC_" + $guid + ".json"
+
+                # Orphan cleanup: remove stale WinUpdateChecker tasks and result files
+                try {
+                    $staleTasks = Get-ScheduledTask -CimSession $cimSess -TaskName "WinUpdateChecker_*" -ErrorAction SilentlyContinue
+                    foreach ($t in $staleTasks) {
+                        Unregister-ScheduledTask -CimSession $cimSess -TaskName $t.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                    }
+                } catch {}
+                try {
+                    $cleanBlock = { Get-ChildItem "C:\Windows\Temp\WUC_*.json" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+                        Remove-Item -Force -ErrorAction SilentlyContinue }
+                    $icParams.ScriptBlock = $cleanBlock
+                    Invoke-Command @icParams | Out-Null
+                } catch {}
+
+                # Bake placeholders into the worker source
+                $baked = $WorkerSrc.Replace("__RESULTPATH__", $resPath)
+                if ($UpdateIDs -and $UpdateIDs.Count -gt 0) {
+                    $quotedIDs = ($UpdateIDs | ForEach-Object { """$_""" }) -join ","
+                    $baked = $baked.Replace("__UPDATEIDS__", $quotedIDs)
+                }
+
+                # Base64-encode for -EncodedCommand (UTF-16LE)
+                $bytes  = [System.Text.Encoding]::Unicode.GetBytes($baked)
+                $b64    = [Convert]::ToBase64String($bytes)
+                $cmdArg = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + $b64
+
+                # Register and start the scheduled task on the target via CIM
+                $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $cmdArg
+                $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -RunLevel Highest -LogonType ServiceAccount
+                $execLimit = New-TimeSpan -Seconds ($TimeoutSec + 60)
+                $settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit $execLimit -MultipleInstances IgnoreNew
+
+                Register-ScheduledTask -CimSession $cimSess -TaskName $taskName `
+                    -Action $action -Principal $principal -Settings $settings `
+                    -Force -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -CimSession $cimSess -TaskName $taskName -ErrorAction Stop
+
+                # Poll until task finishes or deadline exceeded
+                $deadline = (Get-Date).AddSeconds($TimeoutSec)
+                do {
+                    Start-Sleep -Seconds 2
+                    if ((Get-Date) -gt $deadline) {
+                        throw "Remote task timed out after " + $TimeoutSec + " seconds."
+                    }
+                    $info  = Get-ScheduledTaskInfo -CimSession $cimSess -TaskName $taskName -ErrorAction SilentlyContinue
+                    $state = (Get-ScheduledTask -CimSession $cimSess -TaskName $taskName -ErrorAction SilentlyContinue).State
+                } while ($state -eq "Running" -or $info.LastTaskResult -eq 267009)
+
+                # Read result JSON back over WinRM
+                $rawJson = $null
+                try {
+                    $icParams.ScriptBlock = [scriptblock]::Create(
+                        "if (Test-Path """ + $resPath + """) { Get-Content -Raw -LiteralPath """ + $resPath + """ } else { `$null }"
+                    )
+                    $rawJson = Invoke-Command @icParams
+                } catch {}
+
+                if (-not $rawJson) {
+                    $lastResult = if ($info) { $info.LastTaskResult } else { "unknown" }
+                    throw "Remote task produced no output file. LastTaskResult=" + $lastResult
+                }
+
+                return ($rawJson | ConvertFrom-Json)
+
+            } finally {
+                # Cleanup: unregister task, remove result file, close CIM session
+                if ($cimSess) {
+                    try { Unregister-ScheduledTask -CimSession $cimSess -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                    try { Remove-CimSession $cimSess -ErrorAction SilentlyContinue } catch {}
+                }
+                try {
+                    $icParams.ScriptBlock = [scriptblock]::Create(
+                        "Remove-Item -LiteralPath """ + $resPath + """ -Force -ErrorAction SilentlyContinue"
+                    )
+                    Invoke-Command @icParams | Out-Null
+                } catch {}
+            }
+        }
+
+        #-- inner helpers for local path --
 
         function Local-TestPendingReboot {
             $keys = @(
@@ -847,20 +1152,22 @@ function Start-ScanAsync {
             }
         }
 
-        #-- result skeleton -----------------------------------------
+        #-- result skeleton --
         $result = [PSCustomObject]@{
-            Updates       = @()
-            IsPartial     = $false
-            IsRemote      = $IsRemote
-            RebootPending = $false
-            OSVersion     = "Unknown"
-            ErrorKind     = $null
-            ErrorMessage  = $null
+            Updates         = @()
+            IsPartial       = $false
+            IsRemote        = $IsRemote
+            RebootPending   = $false
+            OSVersion       = "Unknown"
+            WuaSearchFailed = $false
+            EffectiveUseSSL = $false    # Fix SSL: probed value returned so install can reuse it
+            ErrorKind       = $null
+            ErrorMessage    = $null
         }
 
         try {
             if ($IsRemote) {
-                # Fix 5: probe 5985 then 5986
+                # Probe 5985 then 5986
                 $port5985 = $false
                 $port5986 = $false
                 try {
@@ -883,73 +1190,92 @@ function Start-ScanAsync {
                     return $result
                 }
 
-                # Fix 5: use SSL when only 5986 is available, or caller requested it
                 $useSSLFlag = ($port5986 -and -not $port5985) -or $UseSSL
+                $result.EffectiveUseSSL = $useSSLFlag   # Fix SSL: carry probed value back to caller
 
-                # Build Invoke-Command param table
-                $icParams = @{
-                    ComputerName = $Target
-                    ErrorAction  = "Stop"
-                }
-                if ($useSSLFlag) { $icParams.UseSSL     = $true }
-                if ($Credential) { $icParams.Credential = $Credential }
-
-                # Gather OS caption from target (Fix 11)
+                # Try the SYSTEM scheduled task WUA path
                 try {
-                    $icParams.ScriptBlock = {
-                        (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+                    $tr = Invoke-RemoteSystemTask -Target $Target -Credential $Credential `
+                        -UseSSL $useSSLFlag -Mode "Scan" -WorkerSrc $ScanWorkerSrc `
+                        -TimeoutSec 300
+
+                    $result.OSVersion     = if ($tr.OSVersion)     { $tr.OSVersion }     else { "Unknown" }
+                    $result.RebootPending = [bool]$tr.RebootPending
+                    $result.Updates       = @($tr.Updates)
+
+                    if ([bool]$tr.WuaSearchFailed) {
+                        # WUA ran under SYSTEM but the search itself failed (proxy/WSUS)
+                        # Fall into the WMI partial path; stamp the flag so the banner
+                        # can explain the specific reason.
+                        $result.IsPartial       = $true
+                        $result.WuaSearchFailed = $true
+                        # tr.Updates already contains WMI fallback rows from the worker
+                    } else {
+                        $result.IsPartial = [bool]$tr.IsPartial
                     }
-                    $osCaption = Invoke-Command @icParams
-                    $result.OSVersion = if ($osCaption) { $osCaption } else { "Unknown" }
                 } catch {
-                    $result.OSVersion = "Unknown"
-                }
+                    # Invoke-RemoteSystemTask failed entirely (CIM unreachable, task error, etc.)
+                    # Fall back to WinRM WMI
+                    $result.IsPartial = $true
 
-                # Fix 3: Remote WUA (Microsoft.Update.Session over WinRM) is blocked by
-                # Windows under network logon (E_ACCESSDENIED).  Go directly to WMI.
-                $result.IsPartial = $true
+                    $icParams = @{ ComputerName = $Target; ErrorAction = "Stop" }
+                    if ($useSSLFlag) { $icParams.UseSSL     = $true }
+                    if ($Credential) { $icParams.Credential = $Credential }
 
-                try {
-                    $icParams.ScriptBlock = {
-                        $hotfixes = Get-CimInstance -ClassName Win32_QuickFixEngineering -ErrorAction Stop
-                        $hotfixes | ForEach-Object {
-                            [PSCustomObject]@{
-                                KB       = $_.HotFixID
-                                Title    = $_.Description
-                                Status   = "Installed"
-                                Severity = "N/A"
-                                Date     = if ($_.InstalledOn) { $_.InstalledOn.ToString("yyyy-MM-dd") } else { "N/A" }
-                                SizeKB   = 0
-                                Source   = "WMI"
-                                UpdateID = ""
+                    # OS caption
+                    try {
+                        $icParams.ScriptBlock = {
+                            (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+                        }
+                        $osCaption = Invoke-Command @icParams
+                        $result.OSVersion = if ($osCaption) { $osCaption } else { "Unknown" }
+                    } catch {
+                        $result.OSVersion = "Unknown"
+                    }
+
+                    # WMI hotfix fallback
+                    try {
+                        $icParams.ScriptBlock = {
+                            $hotfixes = Get-CimInstance -ClassName Win32_QuickFixEngineering -ErrorAction Stop
+                            $hotfixes | ForEach-Object {
+                                [PSCustomObject]@{
+                                    KB       = $_.HotFixID
+                                    Title    = $_.Description
+                                    Status   = "Installed"
+                                    Severity = "N/A"
+                                    Date     = if ($_.InstalledOn) { $_.InstalledOn.ToString("yyyy-MM-dd") } else { "N/A" }
+                                    SizeKB   = 0
+                                    Source   = "WMI"
+                                    UpdateID = ""
+                                }
                             }
                         }
+                        $result.Updates = @(Invoke-Command @icParams)
+                    } catch {
+                        $result.ErrorKind    = "SCAN_FAILED"
+                        $result.ErrorMessage = $_.ToString()
+                        return $result
                     }
-                    $result.Updates = @(Invoke-Command @icParams)
-                } catch {
-                    $result.ErrorKind    = "SCAN_FAILED"
-                    $result.ErrorMessage = $_.ToString()
-                    return $result
-                }
 
-                # Pending reboot check on remote machine
-                try {
-                    $icParams.ScriptBlock = {
-                        $keys = @(
-                            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
-                            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
-                        )
-                        $pr = (Get-ItemProperty `
-                            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" `
-                            -Name PendingFileRenameOperations `
-                            -ErrorAction SilentlyContinue).PendingFileRenameOperations
-                        foreach ($k in $keys) { if (Test-Path $k) { return $true } }
-                        if ($pr) { return $true }
-                        return $false
+                    # Remote reboot check
+                    try {
+                        $icParams.ScriptBlock = {
+                            $keys = @(
+                                "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+                                "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+                            )
+                            $pr = (Get-ItemProperty `
+                                -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" `
+                                -Name PendingFileRenameOperations `
+                                -ErrorAction SilentlyContinue).PendingFileRenameOperations
+                            foreach ($k in $keys) { if (Test-Path $k) { return $true } }
+                            if ($pr) { return $true }
+                            return $false
+                        }
+                        $result.RebootPending = Invoke-Command @icParams
+                    } catch {
+                        $result.RebootPending = $false
                     }
-                    $result.RebootPending = Invoke-Command @icParams
-                } catch {
-                    $result.RebootPending = $false
                 }
 
             } else {
@@ -984,7 +1310,7 @@ function Start-ScanAsync {
         return $result
     ')
 
-    # Create runspace + PowerShell instance (Fix 1: proper async pattern)
+    # Create runspace + PowerShell instance
     $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
     $rs.Open()
 
@@ -996,13 +1322,15 @@ function Start-ScanAsync {
     [void]$ps.AddArgument($IsRemote)
     [void]$ps.AddArgument($Credential)
     [void]$ps.AddArgument($UseSSL)
+    [void]$ps.AddArgument($ScanWorkerSrc)
+    [void]$ps.AddArgument($InstallWorkerSrc)
 
     $script:ActiveOp   = 'Scan'
     $script:RunningPS  = $ps
     $script:RunningRS  = $rs
     $script:PollHandle = $ps.BeginInvoke()
 
-    # Fix 1: WinForms Timer polls on the UI thread (no cross-thread access)
+    # WinForms Timer polls on the UI thread (no cross-thread access)
     $timer          = New-Object System.Windows.Forms.Timer
     $timer.Interval = 500
     $timer.Add_Tick($scanPollTick)
@@ -1011,23 +1339,160 @@ function Start-ScanAsync {
 }
 
 function Start-InstallAsync {
-    param([string[]]$UpdateIDs)
+    param(
+        [string[]]$UpdateIDs,
+        [bool]    $IsRemote,
+        [string]  $Target,
+        [System.Management.Automation.PSCredential]$Credential,
+        [bool]    $UseSSL,
+        [string]  $ScanWorkerSrc,
+        [string]  $InstallWorkerSrc
+    )
 
     # Background install script -- self-contained, same pattern as the scan.
-    # NOTE: single-quoted string; keep it free of apostrophes, inner strings
-    # double-quoted.
+    # Single-quoted: NO apostrophes inside; all inner strings use double-quotes.
     $bgScript = [scriptblock]::Create('
-        param($UpdateIDs)
+        param($UpdateIDs, $IsRemote, $Target, $Credential, $UseSSL, $ScanWorkerSrc, $InstallWorkerSrc)
 
+        #-- Invoke-RemoteSystemTask: duplicated body (runspace cannot see main scope) --
+        function Invoke-RemoteSystemTask {
+            param(
+                [string]$Target,
+                [System.Management.Automation.PSCredential]$Credential,
+                [bool]$UseSSL,
+                [string]$Mode,
+                [string]$WorkerSrc,
+                [string[]]$UpdateIDs,
+                [int]$TimeoutSec
+            )
+
+            $cimOpts   = $null
+            $cimSess   = $null
+            $icParams  = @{ ComputerName = $Target; ErrorAction = "Stop" }
+
+            try {
+                if ($UseSSL) {
+                    $cimOpts = New-CimSessionOption -UseSsl
+                }
+                $cimSessParams = @{ ComputerName = $Target; ErrorAction = "Stop" }
+                if ($Credential) { $cimSessParams.Credential = $Credential }
+                if ($UseSSL)     { $cimSessParams.SessionOption = $cimOpts }
+                $cimSess = New-CimSession @cimSessParams
+
+                if ($Credential) { $icParams.Credential = $Credential }
+                if ($UseSSL)     { $icParams.UseSSL     = $true }
+
+                $guid     = [guid]::NewGuid().ToString("N")
+                $taskName = "WinUpdateChecker_" + $Mode + "_" + $guid
+                $resPath  = "C:\Windows\Temp\WUC_" + $guid + ".json"
+
+                # Orphan cleanup
+                try {
+                    $staleTasks = Get-ScheduledTask -CimSession $cimSess -TaskName "WinUpdateChecker_*" -ErrorAction SilentlyContinue
+                    foreach ($t in $staleTasks) {
+                        Unregister-ScheduledTask -CimSession $cimSess -TaskName $t.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                    }
+                } catch {}
+                try {
+                    $cleanBlock = { Get-ChildItem "C:\Windows\Temp\WUC_*.json" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+                        Remove-Item -Force -ErrorAction SilentlyContinue }
+                    $icParams.ScriptBlock = $cleanBlock
+                    Invoke-Command @icParams | Out-Null
+                } catch {}
+
+                # Bake placeholders
+                $baked = $WorkerSrc.Replace("__RESULTPATH__", $resPath)
+                if ($UpdateIDs -and $UpdateIDs.Count -gt 0) {
+                    $quotedIDs = ($UpdateIDs | ForEach-Object { """$_""" }) -join ","
+                    $baked = $baked.Replace("__UPDATEIDS__", $quotedIDs)
+                }
+
+                $bytes  = [System.Text.Encoding]::Unicode.GetBytes($baked)
+                $b64    = [Convert]::ToBase64String($bytes)
+                $cmdArg = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + $b64
+
+                $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $cmdArg
+                $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -RunLevel Highest -LogonType ServiceAccount
+                $execLimit = New-TimeSpan -Seconds ($TimeoutSec + 60)
+                $settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit $execLimit -MultipleInstances IgnoreNew
+
+                Register-ScheduledTask -CimSession $cimSess -TaskName $taskName `
+                    -Action $action -Principal $principal -Settings $settings `
+                    -Force -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -CimSession $cimSess -TaskName $taskName -ErrorAction Stop
+
+                # Poll
+                $deadline = (Get-Date).AddSeconds($TimeoutSec)
+                do {
+                    Start-Sleep -Seconds 2
+                    if ((Get-Date) -gt $deadline) {
+                        throw "Remote task timed out after " + $TimeoutSec + " seconds."
+                    }
+                    $info  = Get-ScheduledTaskInfo -CimSession $cimSess -TaskName $taskName -ErrorAction SilentlyContinue
+                    $state = (Get-ScheduledTask -CimSession $cimSess -TaskName $taskName -ErrorAction SilentlyContinue).State
+                } while ($state -eq "Running" -or $info.LastTaskResult -eq 267009)
+
+                $rawJson = $null
+                try {
+                    $icParams.ScriptBlock = [scriptblock]::Create(
+                        "if (Test-Path """ + $resPath + """) { Get-Content -Raw -LiteralPath """ + $resPath + """ } else { `$null }"
+                    )
+                    $rawJson = Invoke-Command @icParams
+                } catch {}
+
+                if (-not $rawJson) {
+                    $lastResult = if ($info) { $info.LastTaskResult } else { "unknown" }
+                    throw "Remote task produced no output file. LastTaskResult=" + $lastResult
+                }
+
+                return ($rawJson | ConvertFrom-Json)
+
+            } finally {
+                if ($cimSess) {
+                    try { Unregister-ScheduledTask -CimSession $cimSess -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                    try { Remove-CimSession $cimSess -ErrorAction SilentlyContinue } catch {}
+                }
+                try {
+                    $icParams.ScriptBlock = [scriptblock]::Create(
+                        "Remove-Item -LiteralPath """ + $resPath + """ -Force -ErrorAction SilentlyContinue"
+                    )
+                    Invoke-Command @icParams | Out-Null
+                } catch {}
+            }
+        }
+
+        #-- result skeleton --
         $result = [PSCustomObject]@{
-            Items          = @()     # per-update: KB, Title, Outcome, HResult
-            SkippedTitles  = @()     # CanRequestUserInput or EULA failure
-            NotFoundIDs    = @()     # selected IDs no longer offered by WU
+            Items          = @()
+            SkippedTitles  = @()
+            NotFoundIDs    = @()
             RebootRequired = $false
             ErrorKind      = $null
             ErrorMessage   = $null
         }
 
+        if ($IsRemote) {
+            # Remote install via SYSTEM scheduled task
+            try {
+                $tr = Invoke-RemoteSystemTask -Target $Target -Credential $Credential `
+                    -UseSSL $UseSSL -Mode "Install" -WorkerSrc $InstallWorkerSrc `
+                    -UpdateIDs $UpdateIDs -TimeoutSec 1800
+
+                $result.Items          = @($tr.Items)
+                $result.SkippedTitles  = @($tr.SkippedTitles)
+                $result.NotFoundIDs    = @($tr.NotFoundIDs)
+                $result.RebootRequired = [bool]$tr.RebootRequired
+                $result.ErrorKind      = $tr.ErrorKind
+                $result.ErrorMessage   = $tr.ErrorMessage
+            } catch {
+                $result.ErrorKind    = "INSTALL_FAILED"
+                $result.ErrorMessage = $_.ToString()
+            }
+            return $result
+        }
+
+        # LOCAL install path (existing logic)
         try {
             $session  = New-Object -ComObject Microsoft.Update.Session
             $searcher = $session.CreateUpdateSearcher()
@@ -1108,6 +1573,12 @@ function Start-InstallAsync {
 
     [void]$ps.AddScript($bgScript)
     [void]$ps.AddArgument($UpdateIDs)
+    [void]$ps.AddArgument($IsRemote)
+    [void]$ps.AddArgument($Target)
+    [void]$ps.AddArgument($Credential)
+    [void]$ps.AddArgument($UseSSL)
+    [void]$ps.AddArgument($ScanWorkerSrc)
+    [void]$ps.AddArgument($InstallWorkerSrc)
 
     $script:ActiveOp   = 'Install'
     $script:RunningPS  = $ps
@@ -1143,6 +1614,7 @@ $rbRemote.Add_CheckedChanged({
     }
 })
 
+# Plan item 9: store effective transport in $script:Last* at scan launch
 $btnScan.Add_Click({
     Hide-Error
     $grid.Rows.Clear()
@@ -1173,6 +1645,12 @@ $btnScan.Add_Click({
         if (-not $cred) { return }
     }
 
+    # Plan item 9: capture effective transport for later install
+    $script:LastWasRemote  = $isRemote
+    $script:LastTarget     = $target
+    $script:LastCredential = $cred
+    $script:LastUseSSL     = $false   # UseSSL auto-detected inside bgScript; default false here
+
     $btnScan.Enabled     = $false
     $pnlProgress.Visible = $true
     if ($isRemote) {
@@ -1181,7 +1659,9 @@ $btnScan.Add_Click({
         $lblStatus.Text = 'Scanning...'
     }
 
-    Start-ScanAsync -Target $target -IsRemote $isRemote -Credential $cred -UseSSL $false
+    Start-ScanAsync -Target $target -IsRemote $isRemote -Credential $cred -UseSSL $false `
+        -ScanWorkerSrc $script:RemoteScanWorkerSrc `
+        -InstallWorkerSrc $script:RemoteInstallWorkerSrc
 })
 
 # Fix 10: color ENTIRE row background by status (not just the Status cell).
@@ -1288,15 +1768,23 @@ $btnExportHtml.Add_Click({
     }
 })
 
-# Install Selected
+# Plan item 10: pass remote context to Start-InstallAsync using stored $script:Last* values
+# Plan item 10: name the target in the confirm dialog when remote
 $btnInstall.Add_Click({
     $ids = Get-CheckedUpdateIDs
     if ($ids.Count -eq 0) {
         Show-Error 'No installable updates are checked.'
         return
     }
+
+    $confirmMsg = if ($script:LastWasRemote) {
+        "Download and install $($ids.Count) update(s) on $($script:LastTarget)?"
+    } else {
+        "Download and install $($ids.Count) update(s) on this machine?"
+    }
+
     $confirm = [System.Windows.Forms.MessageBox]::Show(
-        "Download and install $($ids.Count) update(s) on this machine?",
+        $confirmMsg,
         'Confirm Install',
         [System.Windows.Forms.MessageBoxButtons]::YesNo,
         [System.Windows.Forms.MessageBoxIcon]::Question)
@@ -1306,9 +1794,17 @@ $btnInstall.Add_Click({
     $btnScan.Enabled     = $false
     $btnInstall.Enabled  = $false
     $pnlProgress.Visible = $true
-    $lblStatus.Text      = "Downloading and installing $($ids.Count) update(s)... this can take several minutes."
 
-    Start-InstallAsync -UpdateIDs $ids
+    $targetDesc = if ($script:LastWasRemote) { $script:LastTarget } else { 'this machine' }
+    $lblStatus.Text = "Downloading and installing $($ids.Count) update(s) on $targetDesc... this can take several minutes."
+
+    Start-InstallAsync -UpdateIDs $ids `
+        -IsRemote    $script:LastWasRemote `
+        -Target      $script:LastTarget `
+        -Credential  $script:LastCredential `
+        -UseSSL      $script:LastUseSSL `
+        -ScanWorkerSrc    $script:RemoteScanWorkerSrc `
+        -InstallWorkerSrc $script:RemoteInstallWorkerSrc
 })
 
 # Clear
@@ -1330,14 +1826,23 @@ $btnClear.Add_Click({
     Hide-Error
 })
 
+# Plan item 11: FormClosing warning includes note about remote task continuing.
 # Fix 12: clean up timer/runspace if the form closes during an active operation.
 # Closing mid-install gets a warning first: a synchronous WUA Install() cannot
 # be aborted promptly and killing it can leave the update agent busy.
+# Note: if a remote SYSTEM task is running, it will continue on the target;
+# orphan-cleanup-on-next-connect is the safety net for that scenario.
 $form.Add_FormClosing({
     if ($script:ActiveOp -eq 'Install') {
+        $remoteNote = if ($script:LastWasRemote) {
+            " Note: the remote install task on $($script:LastTarget) will continue running until it finishes."
+        } else {
+            ''
+        }
         $answer = [System.Windows.Forms.MessageBox]::Show(
             ('An update installation is in progress. Closing now will not roll it back' +
              ' and may leave Windows Update busy until it finishes.' +
+             $remoteNote +
              "`n`nClose anyway?"),
             'Installation In Progress',
             [System.Windows.Forms.MessageBoxButtons]::YesNo,
