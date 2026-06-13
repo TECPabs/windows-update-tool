@@ -40,20 +40,34 @@ Move from one-machine-at-a-time to managing many machines at once — the core M
 - Mutual-exclusion model changes (N concurrent ops); credential caching is already per-target.
 - Aggregate progress/status reporting.
 
-### 4. Update selectivity  _(medium; mostly additive)_
+### 4. Update selectivity & control  _(medium; mostly additive)_
 
-More control over *which* updates install, instead of "all missing."
+More control over *which* updates install, instead of "all missing." Motivated in part by real-world bad-patch incidents (e.g. the April 2026 Windows Server 2025 reboot-loop updates) where admins need to avoid specific updates.
 
 **Scope**
 - Select/filter by **severity** (Critical/Important/Moderate/Low) and **category** (Security, Critical, Driver, Definition, Optional/Preview).
 - Quick action: **install Critical/Security only**, skip drivers/optional.
 - **KB exclusion / block list** (persisted) — never install specified KBs (e.g. known-bad updates).
+- **Hide / block updates at the WUA level** — mark specific updates "hidden" so Windows stops offering them (the standard approach in comparable tools like WuMgr/WAU), distinct from install-time exclusion.
 - **Dry-run / preview** of what would be installed.
 
 **Design considerations**
-- Capture update **category** in the scan result object (currently we capture severity but not category); WUA exposes `Categories`, `MsrcSeverity`, `BrowseOnly` (optional), `IsMandatory`.
-- Exclusion list needs persistence — an optional sibling `.json` config (keep the portable-single-file principle: absent file = no exclusions).
+- Capture update **category** in the scan result object (currently we capture severity but not category); WUA exposes `Categories`, `MsrcSeverity`, `BrowseOnly` (optional), `IsMandatory`, and supports hide via `IUpdate.IsHidden`.
+- Exclusion/block list needs persistence — an optional sibling `.json` config (keep the portable-single-file principle: absent file = no exclusions).
 - Largely independent of feature #1 — can ship first.
+
+### Remote uninstall / rollback  _(new from landscape research; reuses the remote engine)_
+
+Pull back a bad update — locally or on a remote server — when a patch breaks something. This addresses the most acute current pain point: patches that cause boot/reboot loops.
+
+**Scope**
+- Uninstall a selected installed update on local or remote targets.
+- Pair with the existing **remote reboot** to complete the rollback.
+
+**Design considerations**
+- Run `wusa.exe /uninstall /kb:<id>` (or the WUA/DISM uninstall path) **locally on the target via the same SYSTEM scheduled-task engine** used for remote install — remote uninstall hits the same network-logon restriction as install.
+- Not every update is uninstallable (some are permanent / superseded); detect and surface that clearly.
+- Strong confirmation (removing a security update carries its own risk) and reuse of cached credentials.
 
 ### 5. Audit logging & multi-machine reporting  _(logging is small; reporting builds on #1)_
 
@@ -72,12 +86,21 @@ A compliance trail and client-facing reports.
 
 ## Suggested sequencing
 
-1. **Update selectivity (#4)** and the **per-action audit log (part of #5)** — independent, additive, ship-able without the big refactor.
+1. **Update selectivity & control (#4, incl. hide/block KBs)**, **remote uninstall / rollback**, and the **per-action audit log (part of #5)** — all independent, additive, and ship-able without the big refactor; together they address the most urgent real-world pain (avoiding and removing bad patches).
 2. **Fleet / multi-target (#1)** — the major architectural step (phase sequential, then parallel).
 3. **Multi-machine reporting (rest of #5)** — rides on the fleet data model from #1.
+
+## Farther future
+
+- **Post-reboot health check** — after the remote reboot-wait returns, validate the server came back healthy (key services up, not in a boot loop) rather than just "WinRM answered."
+- **Update history view** — a dedicated history view (dates, categories, installed/failed state) beyond the current scan snapshot, as comparable tools provide.
 
 ## Considered but deferred
 
 - **ConnectWise Manage integration** — auto-post patch notes/time entries to the matching configuration or open/update a ticket. High workflow value given the MSP context; revisit after fleet support exists.
 - **Scheduling & unattended mode** — a headless `-Unattended -Target -Install -Reboot` mode for off-hours maintenance windows via Task Scheduler, with email/report on completion.
 - **Polish**: real per-update download/install progress (vs. marquee), pre-reboot "who's logged on" check, WSUS-vs-Microsoft-Update source selection, disk-space pre-check.
+
+## Non-goals
+
+- **Third-party application patching** (browsers, Java, runtimes, etc.) — the headline differentiator of full RMM/patch suites, but a fundamentally different mechanism (winget/vendor catalogs, not the Windows Update Agent) and a major scope expansion. Intentionally out of scope to keep this a focused, portable WUA utility.
