@@ -208,19 +208,31 @@ $lblTarget.Location = New-Object System.Drawing.Point(10, 12)
 $lblTarget.AutoSize = $true
 $lblTarget.Font     = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 
+# -- Target sub-panel: wraps $rbLocal, $rbRemote, $txtHost in their own WinForms
+# container so WinForms mutual-exclusion applies only to these two radio buttons.
+# Positioned at (65, 8) inside $pnlTarget so that child coords offset correctly:
+#   $rbLocal      Location (0,2)   -> absolute in pnlTarget: (65+0, 8+2) = (65,10)  [was (65,10)]
+#   $rbRemote     Location (120,2) -> absolute: (65+120, 8+2) = (185,10) [was (185,10)]
+#   $txtHost      Location (190,0) -> absolute: (65+190, 8+0) = (255,8)  [was (255,8)]
+$pnlTargetGrp           = New-Object System.Windows.Forms.Panel
+$pnlTargetGrp.Location  = New-Object System.Drawing.Point(65, 8)
+$pnlTargetGrp.Size      = New-Object System.Drawing.Size(700, 30)
+$pnlTargetGrp.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+$pnlTargetGrp.BorderStyle = 'None'
+
 $rbLocal          = New-Object System.Windows.Forms.RadioButton
 $rbLocal.Text     = 'Local Machine'
-$rbLocal.Location = New-Object System.Drawing.Point(65, 10)
+$rbLocal.Location = New-Object System.Drawing.Point(0, 2)
 $rbLocal.AutoSize = $true
 $rbLocal.Checked  = $true
 
 $rbRemote          = New-Object System.Windows.Forms.RadioButton
 $rbRemote.Text     = 'Remote:'
-$rbRemote.Location = New-Object System.Drawing.Point(185, 10)
+$rbRemote.Location = New-Object System.Drawing.Point(120, 2)
 $rbRemote.AutoSize = $true
 
 $txtHost          = New-Object System.Windows.Forms.TextBox
-$txtHost.Location = New-Object System.Drawing.Point(255, 8)
+$txtHost.Location = New-Object System.Drawing.Point(190, 0)
 $txtHost.Width    = 200
 $txtHost.Enabled  = $false
 # Fix 2: PlaceholderText only exists on .NET Core / .NET 5+ WinForms, not on
@@ -229,22 +241,37 @@ if ($txtHost.PSObject.Properties['PlaceholderText']) {
     $txtHost.PlaceholderText = 'hostname or IP'
 }
 
+$pnlTargetGrp.Controls.AddRange(@($rbLocal, $rbRemote, $txtHost))
+
 $lblAuth          = New-Object System.Windows.Forms.Label
 $lblAuth.Text     = 'Auth:'
 $lblAuth.Location = New-Object System.Drawing.Point(10, 44)
 $lblAuth.AutoSize = $true
 $lblAuth.Font     = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 
+# -- Auth sub-panel: wraps $rbCurrentUser, $rbCreds in their own WinForms
+# container so this group is independent of the Target group above.
+# Positioned at (65, 40) inside $pnlTarget:
+#   $rbCurrentUser Location (0,2)   -> absolute in pnlTarget: (65+0, 40+2) = (65,42)  [was (65,42)]
+#   $rbCreds       Location (120,2) -> absolute: (65+120, 40+2) = (185,42) [was (185,42)]
+$pnlAuthGrp           = New-Object System.Windows.Forms.Panel
+$pnlAuthGrp.Location  = New-Object System.Drawing.Point(65, 40)
+$pnlAuthGrp.Size      = New-Object System.Drawing.Size(700, 30)
+$pnlAuthGrp.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+$pnlAuthGrp.BorderStyle = 'None'
+
 $rbCurrentUser           = New-Object System.Windows.Forms.RadioButton
 $rbCurrentUser.Text      = 'Current User'
-$rbCurrentUser.Location  = New-Object System.Drawing.Point(65, 42)
+$rbCurrentUser.Location  = New-Object System.Drawing.Point(0, 2)
 $rbCurrentUser.AutoSize  = $true
 $rbCurrentUser.Checked   = $true
 
 $rbCreds          = New-Object System.Windows.Forms.RadioButton
 $rbCreds.Text     = 'Specify Credentials'
-$rbCreds.Location = New-Object System.Drawing.Point(185, 42)
+$rbCreds.Location = New-Object System.Drawing.Point(120, 2)
 $rbCreds.AutoSize = $true
+
+$pnlAuthGrp.Controls.AddRange(@($rbCurrentUser, $rbCreds))
 
 $btnScan            = New-Object System.Windows.Forms.Button
 $btnScan.Text       = 'Scan Now'
@@ -256,8 +283,11 @@ $btnScan.FlatStyle  = 'Flat'
 $btnScan.Font       = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 $btnScan.Anchor     = 'Top,Right'
 
-$pnlTarget.Controls.AddRange(@($lblTarget, $rbLocal, $rbRemote, $txtHost,
-    $lblAuth, $rbCurrentUser, $rbCreds, $btnScan))
+# $lblTarget, $lblAuth, $btnScan are direct children of $pnlTarget (labels are
+# not radio buttons; $btnScan is anchored Top,Right and must remain here).
+# $pnlTargetGrp and $pnlAuthGrp are the two invisible sub-panels.
+$pnlTarget.Controls.AddRange(@($lblTarget, $lblAuth, $btnScan,
+    $pnlTargetGrp, $pnlAuthGrp))
 
 # -- Summary Panel --
 $pnlSummary           = New-Object System.Windows.Forms.Panel
@@ -1602,7 +1632,9 @@ $rbLocal.Add_CheckedChanged({
         $txtHost.Enabled       = $false
         $rbCurrentUser.Enabled = $false
         $rbCreds.Enabled       = $false
-        $rbCurrentUser.Checked = $true
+        # NOTE: do NOT force $rbCurrentUser.Checked here -- with independent sub-panels
+        # WinForms handles mutual exclusion within each group correctly; forcing
+        # the auth radio from the target handler was the root cause of the old bug.
     }
 })
 
