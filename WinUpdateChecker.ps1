@@ -80,6 +80,7 @@ $script:LastWasRemote   = $false
 $script:LastTarget      = ''
 $script:LastCredential  = $null
 $script:LastUseSSL      = $false
+$script:LastErrorText   = ''    # full text of the last error (for the details dialog)
 #endregion
 
 #region -- Export Functions ---------------------------------------------------
@@ -345,13 +346,22 @@ $pnlError.Dock      = 'Top'
 $pnlError.Height    = 30
 $pnlError.BackColor = [System.Drawing.Color]::FromArgb(255, 230, 230)
 $pnlError.Visible   = $false
-$pnlError.Padding   = New-Object System.Windows.Forms.Padding(10, 5, 10, 0)
+$pnlError.Padding   = New-Object System.Windows.Forms.Padding(10, 5, 10, 5)
 
-$lblError           = New-Object System.Windows.Forms.Label
-$lblError.Dock      = 'Fill'
-$lblError.ForeColor = [System.Drawing.Color]::FromArgb(198, 40, 40)
-$lblError.Font      = New-Object System.Drawing.Font('Segoe UI', 9)
+$lblError              = New-Object System.Windows.Forms.Label
+$lblError.Dock         = 'Fill'
+$lblError.ForeColor    = [System.Drawing.Color]::FromArgb(198, 40, 40)
+$lblError.Font         = New-Object System.Drawing.Font('Segoe UI', 9)
+# Wrap long (e.g. remote WinRM/CIM) messages; show an ellipsis if still clipped,
+# and let the user click the banner for the full, copyable text.
+$lblError.AutoEllipsis = $true
+$lblError.Cursor       = [System.Windows.Forms.Cursors]::Hand
 $pnlError.Controls.Add($lblError)
+
+$errToolTip = New-Object System.Windows.Forms.ToolTip
+$errToolTip.SetToolTip($lblError, 'Click to view the full error and copy it.')
+$lblError.Add_Click({ Show-ErrorDetails })
+$pnlError.Add_Click({ Show-ErrorDetails })
 
 # -- Filter Panel --
 $pnlFilter           = New-Object System.Windows.Forms.Panel
@@ -538,12 +548,66 @@ function Update-InstallButton {
 
 function Show-Error {
     param([string]$Message)
-    $lblError.Text    = $Message
+    $script:LastErrorText = $Message
+    $lblError.Text        = $Message
+    # Grow the banner to fit the wrapped message, capped at ~5 lines so it never
+    # dominates the window; the full text is always available via click.
+    $w = $pnlError.ClientSize.Width - 20
+    if ($w -lt 50) { $w = 600 }   # fallback before the panel has been laid out
+    $sz = [System.Windows.Forms.TextRenderer]::MeasureText(
+        $Message, $lblError.Font,
+        (New-Object System.Drawing.Size($w, 0)),
+        [System.Windows.Forms.TextFormatFlags]::WordBreak)
+    $h = $sz.Height + 12
+    if ($h -lt 30) { $h = 30 }
+    if ($h -gt 96) { $h = 96 }
+    $pnlError.Height  = $h
     $pnlError.Visible = $true
+}
+
+function Show-ErrorDetails {
+    # Full, selectable, copyable error text — for messages too long for the banner.
+    if ([string]::IsNullOrEmpty($script:LastErrorText)) { return }
+    $dlg                 = New-Object System.Windows.Forms.Form
+    $dlg.Text            = 'Error Details'
+    $dlg.Size            = New-Object System.Drawing.Size(640, 360)
+    $dlg.StartPosition   = 'CenterParent'
+    $dlg.MinimizeBox     = $false
+    $dlg.MaximizeBox     = $false
+
+    $txt            = New-Object System.Windows.Forms.TextBox
+    $txt.Multiline  = $true
+    $txt.ReadOnly   = $true
+    $txt.ScrollBars = 'Vertical'
+    $txt.Dock       = 'Fill'
+    $txt.Font       = New-Object System.Drawing.Font('Consolas', 9)
+    $txt.Text       = $script:LastErrorText
+
+    $pnl         = New-Object System.Windows.Forms.Panel
+    $pnl.Dock    = 'Bottom'
+    $pnl.Height  = 40
+    $pnl.Padding = New-Object System.Windows.Forms.Padding(10, 6, 10, 6)
+
+    $btnCopy      = New-Object System.Windows.Forms.Button
+    $btnCopy.Text = 'Copy'
+    $btnCopy.Dock = 'Left'
+    $btnCopy.Width = 90
+    $btnCopy.Add_Click({ [System.Windows.Forms.Clipboard]::SetText($script:LastErrorText) })
+
+    $btnCloseDet      = New-Object System.Windows.Forms.Button
+    $btnCloseDet.Text = 'Close'
+    $btnCloseDet.Dock = 'Right'
+    $btnCloseDet.Width = 90
+    $btnCloseDet.Add_Click({ $dlg.Close() })
+
+    $pnl.Controls.AddRange(@($btnCopy, $btnCloseDet))
+    $dlg.Controls.AddRange(@($txt, $pnl))
+    $dlg.ShowDialog($form) | Out-Null
 }
 
 function Hide-Error {
     $pnlError.Visible = $false
+    $pnlError.Height  = 30
 }
 
 function Update-Summary {
