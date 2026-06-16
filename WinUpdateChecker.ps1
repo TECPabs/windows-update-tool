@@ -202,13 +202,41 @@ $rowsJoined
 #region -- WinForms UI --------------------------------------------------------
 
 # -- Main Form --
-$script:AppVersion  = '1.0.0-beta.3'
+# -- App metadata (shown in the About dialog; also used for the EXE later) --
+$script:AppVersion   = '1.0.0-beta.3'
+$script:AppName      = 'Windows Update Checker'
+$script:AppPublisher = 'Pablo Cartagena / TEC-System'
+$script:AppCopyright = 'Copyright (c) 2026 Pablo Cartagena / TEC-System'
+$script:AppLicense   = 'GPL-3.0'
+$script:AppUrl       = 'https://github.com/TECPabs/windows-update-tool'
+
 $form               = New-Object System.Windows.Forms.Form
-$form.Text          = "Windows Update Checker v$script:AppVersion"
+$form.Text          = "$script:AppName v$script:AppVersion"
 $form.Size          = New-Object System.Drawing.Size(900, 640)
 $form.MinimumSize   = New-Object System.Drawing.Size(700, 500)
 $form.StartPosition = 'CenterScreen'
 $form.Font          = New-Object System.Drawing.Font('Segoe UI', 9)
+
+# -- Window icon (generated at runtime so the tool stays a single file): a blue
+#    rounded tile with a white check. Reused for the About dialog. --
+try {
+    $icoBmp = New-Object System.Drawing.Bitmap 32, 32
+    $icoG   = [System.Drawing.Graphics]::FromImage($icoBmp)
+    $icoG.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $icoG.Clear([System.Drawing.Color]::Transparent)
+    $icoBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(0, 120, 212))
+    $icoG.FillRectangle($icoBrush, 2, 2, 28, 28)
+    $icoPen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), 3
+    $icoG.DrawLines($icoPen, @(
+        (New-Object System.Drawing.Point 8, 17),
+        (New-Object System.Drawing.Point 14, 23),
+        (New-Object System.Drawing.Point 25, 9)))
+    $icoG.Dispose()
+    $script:AppIcon = [System.Drawing.Icon]::FromHandle($icoBmp.GetHicon())
+    $form.Icon = $script:AppIcon
+} catch {
+    $script:AppIcon = $null
+}
 
 # -- Target Panel --
 $pnlTarget           = New-Object System.Windows.Forms.Panel
@@ -543,6 +571,26 @@ $pnlBottom.Controls.AddRange(@($btnExportCsv, $btnExportHtml, $btnClear, $btnIns
 $form.Controls.AddRange(@($grid, $pnlBottom, $pnlFilter, $pnlError,
     $pnlProgress, $pnlSummary, $pnlTarget))
 
+# -- Menu bar (File / Help) -- a standard menu reads as a real application and
+#    gives a home for About + the project link. Added after the panels so it
+#    docks above them (top-docked controls fill from the back of the z-order).
+$menuStrip = New-Object System.Windows.Forms.MenuStrip
+$miFile    = New-Object System.Windows.Forms.ToolStripMenuItem('File')
+$miExit    = New-Object System.Windows.Forms.ToolStripMenuItem('Exit')
+$miExit.Add_Click({ $form.Close() })
+[void]$miFile.DropDownItems.Add($miExit)
+$miHelp    = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
+$miGitHub  = New-Object System.Windows.Forms.ToolStripMenuItem('View on GitHub')
+$miGitHub.Add_Click({ try { Start-Process $script:AppUrl } catch {} })
+$miAbout   = New-Object System.Windows.Forms.ToolStripMenuItem("About $script:AppName")
+$miAbout.Add_Click({ Show-AboutDialog })
+[void]$miHelp.DropDownItems.Add($miGitHub)
+[void]$miHelp.DropDownItems.Add($miAbout)
+[void]$menuStrip.Items.Add($miFile)
+[void]$menuStrip.Items.Add($miHelp)
+$form.MainMenuStrip = $menuStrip
+$form.Controls.Add($menuStrip)
+
 #endregion
 
 #region -- Helper Functions ---------------------------------------------------
@@ -626,6 +674,78 @@ function Register-DisabledGreyout {
         $Button.BackColor = [System.Drawing.SystemColors]::Control
         $Button.ForeColor = [System.Drawing.SystemColors]::GrayText
     }
+}
+
+function Show-AboutDialog {
+    $about                 = New-Object System.Windows.Forms.Form
+    $about.Text            = "About $script:AppName"
+    $about.Size            = New-Object System.Drawing.Size(450, 320)
+    $about.StartPosition   = 'CenterParent'
+    $about.FormBorderStyle = 'FixedDialog'
+    $about.MaximizeBox     = $false
+    $about.MinimizeBox     = $false
+    if ($script:AppIcon) { $about.Icon = $script:AppIcon }
+
+    $pic          = New-Object System.Windows.Forms.PictureBox
+    $pic.Size     = New-Object System.Drawing.Size(48, 48)
+    $pic.Location = New-Object System.Drawing.Point(20, 20)
+    $pic.SizeMode = 'Zoom'
+    if ($script:AppIcon) { $pic.Image = $script:AppIcon.ToBitmap() }
+
+    $lblName          = New-Object System.Windows.Forms.Label
+    $lblName.Text     = $script:AppName
+    $lblName.Location = New-Object System.Drawing.Point(84, 22)
+    $lblName.AutoSize = $true
+    $lblName.Font     = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
+
+    $lblVer          = New-Object System.Windows.Forms.Label
+    $lblVer.Text     = "Version $script:AppVersion"
+    $lblVer.Location = New-Object System.Drawing.Point(86, 50)
+    $lblVer.AutoSize = $true
+    $lblVer.ForeColor = [System.Drawing.Color]::Gray
+
+    $lblDesc          = New-Object System.Windows.Forms.Label
+    $lblDesc.Text     = 'Scan, install, and reboot Windows updates on local and remote machines.'
+    $lblDesc.Location = New-Object System.Drawing.Point(20, 84)
+    $lblDesc.Size     = New-Object System.Drawing.Size(400, 32)
+
+    $lblPub          = New-Object System.Windows.Forms.Label
+    $lblPub.Text     = $script:AppPublisher
+    $lblPub.Location = New-Object System.Drawing.Point(20, 120)
+    $lblPub.AutoSize = $true
+
+    $lblCopy          = New-Object System.Windows.Forms.Label
+    $lblCopy.Text     = $script:AppCopyright
+    $lblCopy.Location = New-Object System.Drawing.Point(20, 142)
+    $lblCopy.AutoSize = $true
+
+    $lblLic          = New-Object System.Windows.Forms.Label
+    $lblLic.Text     = "License: $script:AppLicense"
+    $lblLic.Location = New-Object System.Drawing.Point(20, 164)
+    $lblLic.AutoSize = $true
+
+    $lnk          = New-Object System.Windows.Forms.LinkLabel
+    $lnk.Text     = $script:AppUrl
+    $lnk.Location = New-Object System.Drawing.Point(20, 188)
+    $lnk.AutoSize = $true
+    $lnk.Add_LinkClicked({ try { Start-Process $script:AppUrl } catch {} })
+
+    $lblEnv          = New-Object System.Windows.Forms.Label
+    $lblEnv.Text     = "PowerShell $($PSVersionTable.PSVersion) on $([System.Environment]::OSVersion.VersionString)"
+    $lblEnv.Location = New-Object System.Drawing.Point(20, 216)
+    $lblEnv.AutoSize = $true
+    $lblEnv.ForeColor = [System.Drawing.Color]::Gray
+
+    $btnAboutClose          = New-Object System.Windows.Forms.Button
+    $btnAboutClose.Text     = 'Close'
+    $btnAboutClose.Size     = New-Object System.Drawing.Size(80, 28)
+    $btnAboutClose.Location = New-Object System.Drawing.Point(344, 244)
+    $btnAboutClose.Add_Click({ $about.Close() })
+    $about.AcceptButton = $btnAboutClose
+
+    $about.Controls.AddRange(@($pic, $lblName, $lblVer, $lblDesc, $lblPub,
+        $lblCopy, $lblLic, $lnk, $lblEnv, $btnAboutClose))
+    $about.ShowDialog($form) | Out-Null
 }
 
 function Reset-RebootState {
