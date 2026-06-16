@@ -311,7 +311,7 @@ $pnlTarget.Controls.AddRange(@($lblTarget, $lblAuth, $btnScan,
 # -- Summary Panel --
 $pnlSummary           = New-Object System.Windows.Forms.Panel
 $pnlSummary.Dock      = 'Top'
-$pnlSummary.Height    = 60
+$pnlSummary.Height    = 84
 $pnlSummary.Padding   = New-Object System.Windows.Forms.Padding(10, 8, 10, 0)
 $pnlSummary.BackColor = [System.Drawing.Color]::White
 
@@ -344,7 +344,17 @@ $lblScanTime.Location  = New-Object System.Drawing.Point(10, 36)
 $lblScanTime.AutoSize  = $true
 $lblScanTime.ForeColor = [System.Drawing.Color]::Gray
 
-$pnlSummary.Controls.AddRange(@($lblInstalled, $lblMissing, $lblPending, $lblScanTime))
+# Own full-width row (the WSUS source/pause summary can be long, e.g. a full
+# WSUS URL + pause date — placing it at x=10 on its own row avoids clipping
+# off the right edge of the panel).
+$lblPolicy           = New-Object System.Windows.Forms.Label
+$lblPolicy.Text      = ''
+$lblPolicy.Location  = New-Object System.Drawing.Point(10, 58)
+$lblPolicy.AutoSize  = $true
+$lblPolicy.ForeColor = [System.Drawing.Color]::Gray
+$lblPolicy.Font      = New-Object System.Drawing.Font('Segoe UI', 9)
+
+$pnlSummary.Controls.AddRange(@($lblInstalled, $lblMissing, $lblPending, $lblScanTime, $lblPolicy))
 
 # -- Progress Panel --
 $pnlProgress           = New-Object System.Windows.Forms.Panel
@@ -692,6 +702,33 @@ function Update-Summary {
     }
 }
 
+function Translate-WuaError {
+    # Scans a message string for known WUA hex error codes and returns a
+    # plain-English explanation appended in parentheses.  Safe on any input;
+    # returns the original string unchanged when no known code is found.
+    param([string]$Message)
+    if ([string]::IsNullOrEmpty($Message)) { return $Message }
+
+    $knownCodes = @{
+        '0x8024002E' = 'Windows Update is disabled by Group Policy (access removed).'
+        '0x8024000B' = 'The operation was cancelled by policy.'
+        '0x8024402C' = 'Could not connect to the configured WSUS server.'
+        '0x80244022' = 'The update server returned HTTP 503 (service unavailable).'
+        '0x8024401C' = 'The request to the update server timed out.'
+        '0x80240044' = 'Update install was denied (per-machine policy / WSUS-managed).'
+        '0x80072EE2' = 'Could not reach the update server (network timeout/refused).'
+        '0x80072EFD' = 'Could not reach the update server (network timeout/refused).'
+        '0x800705B4' = 'Could not reach the update server (network timeout/refused).'
+    }
+
+    foreach ($code in $knownCodes.Keys) {
+        if ($Message -match [regex]::Escape($code)) {
+            return "$Message  ($($knownCodes[$code]))"
+        }
+    }
+    return $Message
+}
+
 function Stop-AsyncCleanup {
     # Fix 12: dispose runspace/PS/poll-timer cleanly when the active background
     # operation (scan, install, or reboot sub-op) completes, aborts, or the form closes.
@@ -879,6 +916,69 @@ function Restore-TrustedHosts {
 
 $script:RemoteScanWorkerSrc = '
 $resultPath = "__RESULTPATH__"
+
+function Get-WuPolicyInfo {
+    $wuKey  = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+    $auKey  = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+
+    $wuProps = Get-ItemProperty -Path $wuKey -ErrorAction SilentlyContinue
+    $auProps = Get-ItemProperty -Path $auKey -ErrorAction SilentlyContinue
+
+    $disabled      = [int]($wuProps.DisableWindowsUpdateAccess) -eq 1
+    $noInternet    = [int]($wuProps.DoNotConnectToWindowsUpdateInternetLocations) -eq 1
+    $useWsus       = [int]($auProps.UseWUServer) -eq 1
+    $wsusUrl       = if ($wuProps.WUServer) { [string]$wuProps.WUServer } else { "" }
+    $noAutoUpdate  = [int]($auProps.NoAutoUpdate) -eq 1
+
+    $pauseExp   = if ($wuProps.PauseUpdatesExpiryTime)        { [string]$wuProps.PauseUpdatesExpiryTime }        else { "" }
+    $pauseQual  = if ($wuProps.PauseQualityUpdatesStartTime)  { [string]$wuProps.PauseQualityUpdatesStartTime }  else { "" }
+    $pauseFeat  = if ($wuProps.PauseFeatureUpdatesStartTime)  { [string]$wuProps.PauseFeatureUpdatesStartTime }  else { "" }
+    $isPaused   = ($pauseExp -ne "") -or ($pauseQual -ne "") -or ($pauseFeat -ne "")
+
+    $blocked = $disabled
+    $summary = ""
+    $detail  = ""
+
+    if ($disabled) {
+        $summary = "Windows Update access removed by Group Policy"
+        $detail  = "DisableWindowsUpdateAccess=1 removes access to Windows Update on this machine."
+    } elseif ($useWsus -and $wsusUrl -ne "") {
+        $base = "Source: WSUS (" + $wsusUrl + ")"
+        if ($isPaused) {
+            $expiryNote = if ($pauseExp -ne "") { " until " + $pauseExp } else { "" }
+            $summary = $base + " - updates paused" + $expiryNote
+            $detail  = "WSUS source: " + $wsusUrl + ". Updates are paused" + $expiryNote + "."
+        } else {
+            $summary = $base
+            if ($noInternet) { $summary = $summary + " (internet WU blocked)" }
+            $detail  = ""
+        }
+    } else {
+        $base = "Source: Microsoft Update"
+        if ($isPaused) {
+            $expiryNote = if ($pauseExp -ne "") { " until " + $pauseExp } else { "" }
+            $summary = $base + "; updates paused" + $expiryNote
+            $detail  = "Updates are paused" + $expiryNote + "."
+        } elseif ($noInternet) {
+            $summary = $base + "; internet Windows Update blocked by policy"
+            $detail  = "DoNotConnectToWindowsUpdateInternetLocations=1 prevents connecting to Microsoft Update."
+        } else {
+            $summary = $base + "; no restrictions"
+            $detail  = ""
+        }
+    }
+
+    if ($noAutoUpdate -and -not $disabled) {
+        $detail = ($detail + " NoAutoUpdate=1 (automatic updates off; manual install still allowed).").TrimStart()
+    }
+
+    return [PSCustomObject]@{
+        PolicySummary = $summary
+        PolicyBlocked = $blocked
+        PolicyDetail  = $detail
+    }
+}
+
 $out = [PSCustomObject]@{
     Updates         = @()
     IsPartial       = $false
@@ -886,6 +986,9 @@ $out = [PSCustomObject]@{
     OSVersion       = "Unknown"
     WuaSearchFailed = $false
     WuaSearchError  = ""
+    PolicySummary   = ""
+    PolicyBlocked   = $false
+    PolicyDetail    = ""
     ErrorKind       = $null
     ErrorMessage    = $null
 }
@@ -947,6 +1050,13 @@ try {
         -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
     foreach ($k in $keys) { if (Test-Path $k) { $out.RebootPending = $true } }
     if ($pr) { $out.RebootPending = $true }
+
+    try {
+        $pol = Get-WuPolicyInfo
+        $out.PolicySummary = $pol.PolicySummary
+        $out.PolicyBlocked = $pol.PolicyBlocked
+        $out.PolicyDetail  = $pol.PolicyDetail
+    } catch {}
 } catch {
     $out.ErrorKind    = "SCAN_FAILED"
     $out.ErrorMessage = $_.ToString()
@@ -1127,16 +1237,39 @@ $scanPollTick = {
     # CanReboot: enabled for any successful remote scan (even partial WMI-only), no error
     $script:CanReboot  = [bool]$res.IsRemote -and ($null -eq $res.ErrorKind)
 
+    # Policy indicator label
+    $polSummary = if ($res.PolicySummary) { [string]$res.PolicySummary } else { '' }
+    $polBlocked = [bool]$res.PolicyBlocked
+    $lblPolicy.Text = $polSummary
+    if ($polBlocked) {
+        $lblPolicy.ForeColor = [System.Drawing.Color]::FromArgb(198, 40, 40)
+    } elseif ($polSummary -match 'paused|blocked|restricted') {
+        $lblPolicy.ForeColor = [System.Drawing.Color]::FromArgb(230, 81, 0)
+    } else {
+        $lblPolicy.ForeColor = [System.Drawing.Color]::Gray
+    }
+
     # Plan item 7b/7c: banner logic
     if ($script:IsPartialData -and (-not $res.IsRemote)) {
         # Local scan fell back to WMI
-        Show-Error 'WUA COM unavailable locally - showing installed hotfixes from WMI only.'
+        $bannerMsg = 'WUA COM unavailable locally - showing installed hotfixes from WMI only.'
+        $polDetail = if ($res.PolicyDetail) { [string]$res.PolicyDetail } else { '' }
+        if ($polDetail -ne '') { $bannerMsg = $bannerMsg + '  Policy: ' + $polDetail }
+        Show-Error $bannerMsg
     } elseif ($script:IsPartialData -and $res.IsRemote) {
         # Plan item 7b: remote partial - rewording to not say WUA over WinRM is impossible
         $bannerMsg = 'Accurate WUA scan unavailable on the remote target (Task Scheduler/agent path failed) - showing installed hotfixes from WMI only.'
         if ([bool]$res.WuaSearchFailed) {
+            $wuaErr = if ($res.WuaSearchError) { Translate-WuaError ([string]$res.WuaSearchError) } else { '' }
             $bannerMsg += ' The remote machine ran the scan but Windows Update returned an error (commonly a per-user proxy or unreachable WSUS under the SYSTEM account).'
+            if ($wuaErr -ne '') { $bannerMsg += '  Detail: ' + $wuaErr }
         }
+        $polDetail = if ($res.PolicyDetail) { [string]$res.PolicyDetail } else { '' }
+        if ($polDetail -ne '') { $bannerMsg = $bannerMsg + '  Policy: ' + $polDetail }
+        Show-Error $bannerMsg
+    } elseif ($polBlocked) {
+        $polDetail = if ($res.PolicyDetail) { [string]$res.PolicyDetail } else { '' }
+        $bannerMsg = if ($polDetail -ne '') { $polDetail } else { [string]$res.PolicySummary }
         Show-Error $bannerMsg
     } else {
         Hide-Error
@@ -1185,7 +1318,7 @@ $installPollTick = {
         } else {
             'Unknown error'
         }
-        Show-Error "Install error: $errTxt"
+        Show-Error "Install error: $(Translate-WuaError $errTxt)"
         $lblStatus.Text = 'Install failed.'
         return
     }
@@ -1199,7 +1332,7 @@ $installPollTick = {
     }
 
     if ($res.ErrorKind) {
-        Show-Error "Install failed: $($res.ErrorMessage)"
+        Show-Error "Install failed: $(Translate-WuaError ([string]$res.ErrorMessage))"
         $lblStatus.Text = 'Install failed.'
         return
     }
@@ -1223,7 +1356,10 @@ $installPollTick = {
     $lines = @("Install Results", ("-" * 60))
     foreach ($item in $res.Items) {
         $line = "$($item.Outcome.PadRight(22)) $($item.KB.PadRight(11)) $($item.Title)"
-        if ($item.Outcome -notlike 'Succeeded*') { $line += "  [HResult $($item.HResult)]" }
+        if ($item.Outcome -notlike 'Succeeded*') {
+            $hresultMsg = Translate-WuaError ([string]$item.HResult)
+            $line += "  [HResult $hresultMsg]"
+        }
         $lines += $line
     }
     foreach ($s in $res.SkippedTitles) { $lines += "Skipped                $s" }
@@ -1463,6 +1599,68 @@ function Start-ScanAsync {
             }
         }
 
+        function Local-GetWuPolicyInfo {
+            $wuKey  = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+            $auKey  = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+
+            $wuProps = Get-ItemProperty -Path $wuKey -ErrorAction SilentlyContinue
+            $auProps = Get-ItemProperty -Path $auKey -ErrorAction SilentlyContinue
+
+            $disabled     = [int]($wuProps.DisableWindowsUpdateAccess) -eq 1
+            $noInternet   = [int]($wuProps.DoNotConnectToWindowsUpdateInternetLocations) -eq 1
+            $useWsus      = [int]($auProps.UseWUServer) -eq 1
+            $wsusUrl      = if ($wuProps.WUServer) { [string]$wuProps.WUServer } else { "" }
+            $noAutoUpdate = [int]($auProps.NoAutoUpdate) -eq 1
+
+            $pauseExp  = if ($wuProps.PauseUpdatesExpiryTime)        { [string]$wuProps.PauseUpdatesExpiryTime }        else { "" }
+            $pauseQual = if ($wuProps.PauseQualityUpdatesStartTime)  { [string]$wuProps.PauseQualityUpdatesStartTime }  else { "" }
+            $pauseFeat = if ($wuProps.PauseFeatureUpdatesStartTime)  { [string]$wuProps.PauseFeatureUpdatesStartTime }  else { "" }
+            $isPaused  = ($pauseExp -ne "") -or ($pauseQual -ne "") -or ($pauseFeat -ne "")
+
+            $blocked = $disabled
+            $summary = ""
+            $detail  = ""
+
+            if ($disabled) {
+                $summary = "Windows Update access removed by Group Policy"
+                $detail  = "DisableWindowsUpdateAccess=1 removes access to Windows Update on this machine."
+            } elseif ($useWsus -and $wsusUrl -ne "") {
+                $base = "Source: WSUS (" + $wsusUrl + ")"
+                if ($isPaused) {
+                    $expiryNote = if ($pauseExp -ne "") { " until " + $pauseExp } else { "" }
+                    $summary = $base + " - updates paused" + $expiryNote
+                    $detail  = "WSUS source: " + $wsusUrl + ". Updates are paused" + $expiryNote + "."
+                } else {
+                    $summary = $base
+                    if ($noInternet) { $summary = $summary + " (internet WU blocked)" }
+                    $detail  = ""
+                }
+            } else {
+                $base = "Source: Microsoft Update"
+                if ($isPaused) {
+                    $expiryNote = if ($pauseExp -ne "") { " until " + $pauseExp } else { "" }
+                    $summary = $base + "; updates paused" + $expiryNote
+                    $detail  = "Updates are paused" + $expiryNote + "."
+                } elseif ($noInternet) {
+                    $summary = $base + "; internet Windows Update blocked by policy"
+                    $detail  = "DoNotConnectToWindowsUpdateInternetLocations=1 prevents connecting to Microsoft Update."
+                } else {
+                    $summary = $base + "; no restrictions"
+                    $detail  = ""
+                }
+            }
+
+            if ($noAutoUpdate -and -not $disabled) {
+                $detail = ($detail + " NoAutoUpdate=1 (automatic updates off; manual install still allowed).").TrimStart()
+            }
+
+            return [PSCustomObject]@{
+                PolicySummary = $summary
+                PolicyBlocked = $blocked
+                PolicyDetail  = $detail
+            }
+        }
+
         #-- result skeleton --
         $result = [PSCustomObject]@{
             Updates         = @()
@@ -1472,6 +1670,9 @@ function Start-ScanAsync {
             OSVersion       = "Unknown"
             WuaSearchFailed = $false
             EffectiveUseSSL = $false    # Fix SSL: probed value returned so install can reuse it
+            PolicySummary   = ""
+            PolicyBlocked   = $false
+            PolicyDetail    = ""
             ErrorKind       = $null
             ErrorMessage    = $null
         }
@@ -1513,6 +1714,9 @@ function Start-ScanAsync {
                     $result.OSVersion     = if ($tr.OSVersion)     { $tr.OSVersion }     else { "Unknown" }
                     $result.RebootPending = [bool]$tr.RebootPending
                     $result.Updates       = @($tr.Updates)
+                    $result.PolicySummary = if ($tr.PolicySummary) { [string]$tr.PolicySummary } else { "" }
+                    $result.PolicyBlocked = [bool]$tr.PolicyBlocked
+                    $result.PolicyDetail  = if ($tr.PolicyDetail)  { [string]$tr.PolicyDetail }  else { "" }
 
                     if ([bool]$tr.WuaSearchFailed) {
                         # WUA ran under SYSTEM but the search itself failed (proxy/WSUS)
@@ -1612,6 +1816,13 @@ function Start-ScanAsync {
                 }
 
                 $result.RebootPending = Local-TestPendingReboot
+
+                try {
+                    $pol = Local-GetWuPolicyInfo
+                    $result.PolicySummary = $pol.PolicySummary
+                    $result.PolicyBlocked = $pol.PolicyBlocked
+                    $result.PolicyDetail  = $pol.PolicyDetail
+                } catch {}
             }
         } catch {
             $result.ErrorKind    = "SCAN_FAILED"
@@ -2290,6 +2501,8 @@ $btnScan.Add_Click({
     $lblPending.Text      = 'Reboot Pending: -'
     $lblPending.ForeColor = [System.Drawing.Color]::FromArgb(230, 81, 0)
     $lblScanTime.Text     = ''
+    $lblPolicy.Text       = ''
+    $lblPolicy.ForeColor  = [System.Drawing.Color]::Gray
 
     $isRemote = $rbRemote.Checked
     $target   = $txtHost.Text.Trim()
@@ -2561,6 +2774,8 @@ $btnClear.Add_Click({
     $lblPending.Text      = 'Reboot Pending: -'
     $lblPending.ForeColor = [System.Drawing.Color]::FromArgb(230, 81, 0)
     $lblScanTime.Text     = ''
+    $lblPolicy.Text       = ''
+    $lblPolicy.ForeColor  = [System.Drawing.Color]::Gray
     $lblStatus.Text       = 'Ready'
     Hide-Error
 })
