@@ -43,13 +43,9 @@ winrm quickconfig
 
 How remote scanning/installing works: Windows blocks the Windows Update Agent API from being called remotely, so the tool registers a one-shot scheduled task that runs the WUA scan/install **locally on the target as SYSTEM**, then reads the results back. If that path is unavailable (e.g. Task Scheduler disabled, or SYSTEM has no path to Windows Update), it falls back to a WMI query of installed hotfixes and shows a "partial data" banner.
 
-**Targeting by IP address:** when you connect to an IP (rather than a hostname) with explicit credentials, WinRM requires the IP to be trusted. On the machine running the tool (as Administrator):
+**Targeting by IP address:** when you connect to an IP (rather than a hostname) with explicit credentials, WinRM requires the IP to be in the client's TrustedHosts list. **The tool manages this automatically** — it adds the target to TrustedHosts when you scan it and restores your original TrustedHosts when the app closes. (The original list is saved to a marker file so that if the app is killed before it can restore, the next launch cleans up the leftover entry.) Pre-existing TrustedHosts entries are always preserved.
 
-```powershell
-Set-Item WSMan:\localhost\Client\TrustedHosts -Value '<target-ip>' -Concatenate -Force
-```
-
-Alternatively, configure WinRM over HTTPS (port 5986) on the target, which the tool auto-detects.
+If you'd rather manage it yourself, you can add the host manually (`Set-Item WSMan:\localhost\Client\TrustedHosts -Value '<target-ip>' -Concatenate -Force`) or configure WinRM over HTTPS (port 5986) on the target, which the tool auto-detects.
 
 ## Notes
 
