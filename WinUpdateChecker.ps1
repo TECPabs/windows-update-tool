@@ -601,6 +601,33 @@ function Update-RebootButton {
                          $script:RebootPending
 }
 
+function Register-DisabledGreyout {
+    # Custom-colored FlatStyle buttons do NOT auto-grey when disabled (WinForms
+    # keeps the custom BackColor), so a disabled green/red button still looks
+    # active. This stashes the button's design-time (enabled) colors on its Tag
+    # and swaps to a system "disabled" grey whenever Enabled flips to false,
+    # restoring the original colors when re-enabled.
+    param($Button)
+    $Button.Tag = @{ Back = $Button.BackColor; Fore = $Button.ForeColor }
+    $Button.Add_EnabledChanged({
+        param($sender, $e)
+        $c = $sender.Tag
+        if ($sender.Enabled) {
+            $sender.BackColor = $c.Back
+            $sender.ForeColor = $c.Fore
+        } else {
+            $sender.BackColor = [System.Drawing.SystemColors]::Control
+            $sender.ForeColor = [System.Drawing.SystemColors]::GrayText
+        }
+    })
+    # Sync the current visual state (a button created disabled keeps its design
+    # color until the first EnabledChanged, so apply the grey now if needed).
+    if (-not $Button.Enabled) {
+        $Button.BackColor = [System.Drawing.SystemColors]::Control
+        $Button.ForeColor = [System.Drawing.SystemColors]::GrayText
+    }
+}
+
 function Reset-RebootState {
     # Stop and dispose the countdown timer, then return all reboot state to Idle.
     # Called from: Abort-done, Stop-Waiting click, Wait-done, error paths.
@@ -2857,6 +2884,12 @@ $rbCreds.Enabled       = $false
 # Must run before ShowDialog so any stale marker from a prior crash is healed
 # before the user can trigger a remote scan.
 Initialize-TrustedHostsManagement
+
+# Make the custom-colored buttons visibly grey out while disabled (and the
+# Install/Reboot buttons start disabled, so this also greys them at launch).
+Register-DisabledGreyout $btnScan
+Register-DisabledGreyout $btnInstall
+Register-DisabledGreyout $btnReboot
 
 [void]$form.ShowDialog()
 #endregion
