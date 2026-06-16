@@ -94,6 +94,11 @@ $script:LastCredential  = $null
 $script:LastCredTarget  = ''    # target the cached credential was entered for (reuse key)
 $script:LastUseSSL      = $false
 $script:LastErrorText   = ''    # full text of the last error (for the details dialog)
+# TrustedHosts auto-management state
+$script:TrustedHostsManaged    = $false  # false if WSMan unavailable / non-admin
+$script:OriginalTrustedHosts   = $null   # value at startup (baseline)
+$script:AddedTrustedHosts      = @()     # hosts added this session (for restore logic)
+$script:TrustedHostsMarkerPath = Join-Path $env:LOCALAPPDATA 'WinUpdateChecker\trustedhosts.json'
 #endregion
 
 #region -- Export Functions ---------------------------------------------------
@@ -715,6 +720,148 @@ function Stop-AsyncCleanup {
     # For Reboot ops: the reboot tick handler re-asserts ActiveOp='Reboot' immediately
     # after calling this (before any other UI-thread code can run), so clearing here is safe.
     $script:ActiveOp = $null
+}
+
+#endregion
+
+#region -- TrustedHosts Auto-Management ---------------------------------------
+#
+# Two thin WSMan wrappers make all real logic unit-testable: tests simply
+# redefine Get-CurrentTrustedHosts / Set-CurrentTrustedHosts to operate on an
+# in-memory variable instead of the real WSMan provider.
+#
+# Design constraints:
+#   - PS 5.1 / .NET Framework only.
+#   - Non-admin / WSMan-unavailable -> TrustedHostsManaged=$false, all no-ops.
+#   - Never remove pre-existing entries; baseline-restore handles full revert.
+#   - Handles '*' wildcard (skip adding; already globally trusted).
+#   - Empty baseline round-trips correctly (clearing TrustedHosts to '' is valid).
+
+function Get-CurrentTrustedHosts {
+    # Returns the current TrustedHosts string value, or $null on failure.
+    try {
+        return (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop).Value
+    } catch {
+        return $null
+    }
+}
+
+function Set-CurrentTrustedHosts {
+    param([string]$Value)
+    # Sets TrustedHosts to $Value (empty string clears the list). Returns $true on
+    # success, $false on failure.
+    try {
+        Set-Item WSMan:\localhost\Client\TrustedHosts -Value $Value -Force -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Initialize-TrustedHostsManagement {
+    # Called once at startup.
+    # 1. If a marker file exists (previous crash): restore baseline and delete it.
+    # 2. Capture current value as baseline, write fresh marker.
+    # No-ops gracefully if WSMan is unavailable or this process lacks admin.
+
+    # Ensure the directory exists (no-op if already present).
+    $markerDir = Split-Path $script:TrustedHostsMarkerPath -Parent
+    if (-not (Test-Path $markerDir)) {
+        try { New-Item -ItemType Directory -Path $markerDir -Force -ErrorAction Stop | Out-Null }
+        catch { $script:TrustedHostsManaged = $false; return }
+    }
+
+    # Crash-sweep: if a stale marker exists, restore the baseline it contains.
+    if (Test-Path $script:TrustedHostsMarkerPath) {
+        try {
+            $stale = Get-Content -Raw -LiteralPath $script:TrustedHostsMarkerPath -ErrorAction Stop |
+                     ConvertFrom-Json -ErrorAction Stop
+            $staleBaseline = [string]$stale.Baseline   # may be empty string
+            Set-CurrentTrustedHosts -Value $staleBaseline | Out-Null
+        } catch {
+            # If we cannot read/parse the marker or restore, remove it and continue.
+        }
+        try { Remove-Item -LiteralPath $script:TrustedHostsMarkerPath -Force -ErrorAction SilentlyContinue } catch {}
+    }
+
+    # Probe WSMan availability (also validates admin rights).
+    $currentValue = Get-CurrentTrustedHosts
+    if ($null -eq $currentValue) {
+        # WSMan unavailable or access denied -- no-op for the entire session.
+        $script:TrustedHostsManaged  = $false
+        $script:OriginalTrustedHosts = $null
+        return
+    }
+
+    # Capture baseline and write marker so a crash leaves the next launch able to restore.
+    $script:OriginalTrustedHosts = $currentValue
+    $script:TrustedHostsManaged  = $true
+    $script:AddedTrustedHosts    = @()
+
+    try {
+        $marker = [PSCustomObject]@{ Baseline = $currentValue } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($script:TrustedHostsMarkerPath, $marker,
+            [System.Text.Encoding]::UTF8)
+    } catch {
+        # Cannot write marker -- disable management to avoid partial state.
+        $script:TrustedHostsManaged  = $false
+        $script:OriginalTrustedHosts = $null
+    }
+}
+
+function Add-TrustedHostForTarget {
+    param([string]$Target)
+    # Ensures $Target is in TrustedHosts for the duration of this session.
+    # Idempotent: no-op if already present or if '*' is set.
+    # Records added hosts in $script:AddedTrustedHosts so Restore-TrustedHosts
+    # can report what was cleaned up.
+
+    if (-not $script:TrustedHostsManaged) { return }
+    if ([string]::IsNullOrWhiteSpace($Target)) { return }
+
+    try {
+        $current = Get-CurrentTrustedHosts
+        if ($null -eq $current) { return }
+
+        # '*' means all hosts are already trusted -- nothing to add.
+        if ($current -eq '*') { return }
+
+        # Case-insensitive check: split on comma, trim each entry.
+        $entries = $current -split ',' | ForEach-Object { $_.Trim() } |
+                   Where-Object { $_ -ne '' }
+        foreach ($e in $entries) {
+            if ($e -ieq $Target) { return }   # already present; not ours to track
+        }
+
+        # Append target.
+        $newValue = if ($current -eq '') { $Target } else { "$current,$Target" }
+        $ok = Set-CurrentTrustedHosts -Value $newValue
+        if ($ok) {
+            $script:AddedTrustedHosts += $Target
+            $lblStatus.Text = "Added $Target to TrustedHosts (removed on exit)."
+        } else {
+            $lblStatus.Text = "Could not update TrustedHosts for $Target (will proceed)."
+        }
+    } catch {
+        $lblStatus.Text = "Could not update TrustedHosts: $($_.Exception.Message)"
+        # Non-fatal -- scan continues regardless.
+    }
+}
+
+function Restore-TrustedHosts {
+    # Called from FormClosing (after all user-cancel checks).
+    # Restores TrustedHosts to exactly the baseline captured at startup,
+    # then deletes the marker file. Wrapped in try/catch (non-fatal).
+    if (-not $script:TrustedHostsManaged) { return }
+    try {
+        Set-CurrentTrustedHosts -Value $script:OriginalTrustedHosts | Out-Null
+    } catch { }
+    try {
+        if (Test-Path $script:TrustedHostsMarkerPath) {
+            Remove-Item -LiteralPath $script:TrustedHostsMarkerPath -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+    $script:TrustedHostsManaged = $false
 }
 
 #endregion
@@ -2172,6 +2319,11 @@ $btnScan.Add_Click({
     $script:LastCredential = $cred
     $script:LastUseSSL     = $false   # UseSSL auto-detected inside bgScript; default false here
 
+    # Auto-manage TrustedHosts: ensure the remote target is trusted before connecting.
+    if ($isRemote) {
+        Add-TrustedHostForTarget -Target $target
+    }
+
     $btnScan.Enabled     = $false
     $pnlProgress.Visible = $true
     if ($isRemote) {
@@ -2470,6 +2622,8 @@ $form.Add_FormClosing({
         $script:RebootTimer.Dispose()
         $script:RebootTimer = $null
     }
+    # Restore TrustedHosts to baseline (removes session-added entries, keeps pre-existing).
+    Restore-TrustedHosts
     Stop-AsyncCleanup
 })
 
@@ -2479,6 +2633,11 @@ $form.Add_FormClosing({
 # Fix 4: Auth controls start disabled because Local Machine is the default
 $rbCurrentUser.Enabled = $false
 $rbCreds.Enabled       = $false
+
+# Initialize TrustedHosts auto-management (crash sweep + baseline capture).
+# Must run before ShowDialog so any stale marker from a prior crash is healed
+# before the user can trigger a remote scan.
+Initialize-TrustedHostsManagement
 
 [void]$form.ShowDialog()
 #endregion
