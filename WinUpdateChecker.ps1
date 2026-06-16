@@ -592,9 +592,13 @@ function Update-RebootButton {
     # Only governs Idle baseline; Countdown/Waiting phases set button text/enabled explicitly.
     if ($script:RebootPhase -ne 'Idle') { return }
     $btnReboot.Text    = 'Reboot Remote'
+    # Enabled only for a successful remote scan AND when a reboot is actually
+    # pending on the target (i.e. after a remote install that requires a restart,
+    # or a box already in a pending-reboot state) -- not merely after any scan.
     $btnReboot.Enabled = ($null -eq $script:ActiveOp) -and
                          $script:CanReboot -and
-                         $script:LastWasRemote
+                         $script:LastWasRemote -and
+                         $script:RebootPending
 }
 
 function Reset-RebootState {
