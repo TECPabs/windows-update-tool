@@ -11,6 +11,8 @@ _Last updated: 2026-06-13 — current release: **v1.0.0-beta.3**_
 - **Remote reboot** with a 60s warning/abort countdown, down-then-up wait, and auto-rescan.
 - Remote operations run WUA locally on the target via a one-shot **SYSTEM scheduled task** (the supported way around Windows' block on remote update API calls).
 - Per-target **credential caching** (sign in once), color-coded results, status/severity filters, detail popup, CSV/HTML export, self-elevation.
+- **Automatic TrustedHosts management** — remote IP targets are added to WinRM TrustedHosts on use and the original list is restored on exit (crash-resilient via a marker file).
+- **Windows Update policy detection & error translation** — an always-on indicator shows each machine's update source (Microsoft Update / WSUS) and restrictions (policy block, no-auto-update, paused), and cryptic WUA error codes are translated to plain English in banners and failure messages.
 
 ## Design principles (keep future work consistent)
 

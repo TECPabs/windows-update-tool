@@ -8,6 +8,8 @@ A portable PowerShell WinForms GUI tool for verifying Windows Update status on l
 - **Install missing updates** — check missing updates in the grid and click **Install Selected**, on the **local machine or a remote server**
 - **Remote reboot** — restart a remote server after patching, with a 60-second warning + **Abort** countdown, then it waits for the server to come back and automatically re-scans
 - **Sign in once** — credentials entered for a remote target are cached and reused for install, reboot, and re-scans
+- **Update source & policy indicator** — shows each machine's update source (Microsoft Update or WSUS) and any restrictions (Group Policy block, automatic updates off, updates paused), and translates cryptic Windows Update error codes into plain English
+- **Automatic TrustedHosts handling** — remote IP targets are trusted for the session and your original WinRM TrustedHosts list is restored on exit
 - **Color-coded results** — green (Installed), red (Missing), plus a separate Reboot Pending indicator
 - **Filters** — filter by Status and Severity (exports respect the active filters)
 - **Detail popup** — double-click any row for full update details + Microsoft KB link
