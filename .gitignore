@@ -9,3 +9,7 @@
 # Temp files
 *.tmp
 *.log
+
+# Build output (the EXE is published via GitHub releases, not committed)
+dist/
+*.exe
