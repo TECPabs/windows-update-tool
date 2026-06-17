@@ -217,26 +217,44 @@ $form.MinimumSize   = New-Object System.Drawing.Size(700, 500)
 $form.StartPosition = 'CenterScreen'
 $form.Font          = New-Object System.Drawing.Font('Segoe UI', 9)
 
-# -- Window icon (generated at runtime so the tool stays a single file): a blue
-#    rounded tile with a white check. Reused for the About dialog. --
+# -- Window icon. Source order: (1) assets\icon.ico next to the script (repo /
+#    .ps1 use); (2) the compiled EXE's own embedded icon (ps2exe -iconFile);
+#    (3) a generated blue tile as a last-resort fallback so a lone .ps1 still
+#    shows something. Reused for the About dialog. --
+$script:AppIcon = $null
 try {
-    $icoBmp = New-Object System.Drawing.Bitmap 32, 32
-    $icoG   = [System.Drawing.Graphics]::FromImage($icoBmp)
-    $icoG.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $icoG.Clear([System.Drawing.Color]::Transparent)
-    $icoBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(0, 120, 212))
-    $icoG.FillRectangle($icoBrush, 2, 2, 28, 28)
-    $icoPen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), 3
-    $icoG.DrawLines($icoPen, @(
-        (New-Object System.Drawing.Point 8, 17),
-        (New-Object System.Drawing.Point 14, 23),
-        (New-Object System.Drawing.Point 25, 9)))
-    $icoG.Dispose()
-    $script:AppIcon = [System.Drawing.Icon]::FromHandle($icoBmp.GetHicon())
-    $form.Icon = $script:AppIcon
+    $icoPath = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'assets\icon.ico' } else { $null }
+    $procName = [System.Diagnostics.Process]::GetCurrentProcess().ProcessName
+    if ($icoPath -and (Test-Path $icoPath)) {
+        $script:AppIcon = New-Object System.Drawing.Icon($icoPath)
+    } elseif ($procName -notmatch '^(powershell|pwsh)$') {
+        # Running as the compiled EXE -- use its own embedded icon resource.
+        $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $script:AppIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath)
+    }
 } catch {
     $script:AppIcon = $null
 }
+if (-not $script:AppIcon) {
+    try {
+        $icoBmp = New-Object System.Drawing.Bitmap 32, 32
+        $icoG   = [System.Drawing.Graphics]::FromImage($icoBmp)
+        $icoG.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $icoG.Clear([System.Drawing.Color]::Transparent)
+        $icoBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(0, 120, 212))
+        $icoG.FillRectangle($icoBrush, 2, 2, 28, 28)
+        $icoPen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), 3
+        $icoG.DrawLines($icoPen, @(
+            (New-Object System.Drawing.Point 8, 17),
+            (New-Object System.Drawing.Point 14, 23),
+            (New-Object System.Drawing.Point 25, 9)))
+        $icoG.Dispose()
+        $script:AppIcon = [System.Drawing.Icon]::FromHandle($icoBmp.GetHicon())
+    } catch {
+        $script:AppIcon = $null
+    }
+}
+if ($script:AppIcon) { $form.Icon = $script:AppIcon }
 
 # -- Target Panel --
 $pnlTarget           = New-Object System.Windows.Forms.Panel
