@@ -45,8 +45,8 @@ Write-Host "Compiling`n  $InputFile`n-> $OutputFile"
 Invoke-ps2exe -inputFile $InputFile -outputFile $OutputFile -iconFile $IconFile `
     -title     'Windows Update Checker' `
     -product   'Windows Update Checker' `
-    -company   'Pablo Cartagena / TEC-System' `
-    -copyright 'Copyright (c) 2026 Pablo Cartagena / TEC-System' `
+    -company   'Pablo Cartagena / TEC Building Systems LLC' `
+    -copyright 'Copyright (c) 2026 Pablo Cartagena / TEC Building Systems LLC' `
     -version   $Version `
     -requireAdmin `
     -noConsole

@@ -205,8 +205,8 @@ $rowsJoined
 # -- App metadata (shown in the About dialog; also used for the EXE later) --
 $script:AppVersion   = '1.0.0-beta.3'
 $script:AppName      = 'Windows Update Checker'
-$script:AppPublisher = 'Pablo Cartagena / TEC-System'
-$script:AppCopyright = 'Copyright (c) 2026 Pablo Cartagena / TEC-System'
+$script:AppPublisher = 'Pablo Cartagena / TEC Building Systems LLC'
+$script:AppCopyright = 'Copyright (c) 2026 Pablo Cartagena / TEC Building Systems LLC'
 $script:AppLicense   = 'GPL-3.0'
 $script:AppUrl       = 'https://github.com/TECPabs/windows-update-tool'
 
