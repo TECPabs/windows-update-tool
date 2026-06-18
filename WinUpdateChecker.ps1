@@ -208,7 +208,7 @@ $script:AppName      = 'Windows Update Checker'
 $script:AppPublisher = 'Pablo Cartagena / TEC Building Systems LLC'
 $script:AppCopyright = 'Copyright (c) 2026 Pablo Cartagena / TEC Building Systems LLC'
 $script:AppLicense   = 'GPL-3.0'
-$script:AppUrl       = 'https://github.com/TECPabs/windows-update-tool'
+$script:AppUrl       = 'https://github.com/TEC-Systems/windows-update-tool'
 
 $form               = New-Object System.Windows.Forms.Form
 $form.Text          = "$script:AppName v$script:AppVersion"
