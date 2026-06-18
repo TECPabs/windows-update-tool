@@ -1377,7 +1377,12 @@ $scanPollTick = {
 
     # Application-level error flags returned in the result object
     if ($res.ErrorKind -eq 'UNREACHABLE') {
-        Show-Error "WinRM unreachable on '$($res.ErrorMessage)' - enable it with: winrm quickconfig"
+        Show-Error ("Couldn't reach '$($res.ErrorMessage)' on WinRM ports 5985/5986. Check: " +
+            "(1) the address is correct and reachable from this machine - a multi-homed target can have " +
+            "several IPs, so use the one on your subnet rather than its hostname; " +
+            "(2) WinRM is enabled on the target (run 'Enable-PSRemoting -Force' there - the service alone " +
+            "is not enough, it needs a listener on 5985); " +
+            "(3) the firewall allows WS-Management (TCP 5985, or 5986 for HTTPS).")
         $lblStatus.Text = 'Scan failed.'
         return
     }
@@ -2338,7 +2343,9 @@ $rebootPollTick = {
             $ek = if ($res) { $res.ErrorKind } else { 'null result' }
             $em = if ($res) { $res.ErrorMessage } else { 'No result from reboot operation.' }
             if ($ek -eq 'UNREACHABLE') {
-                Show-Error "Cannot reach $($script:LastTarget) to schedule reboot - WinRM unreachable."
+                Show-Error ("Couldn't reach $($script:LastTarget) on WinRM ports 5985/5986 to schedule the reboot. " +
+                    "Check the address is reachable from this machine (multi-homed targets can have several IPs), " +
+                    "WinRM is enabled there, and the firewall allows it.")
             } else {
                 Show-Error "Reboot failed ($ek): $em"
             }
