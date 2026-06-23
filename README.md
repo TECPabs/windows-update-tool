@@ -49,6 +49,17 @@ How remote scanning/installing works: Windows blocks the Windows Update Agent AP
 
 If you'd rather manage it yourself, you can add the host manually (`Set-Item WSMan:\localhost\Client\TrustedHosts -Value '<target-ip>' -Concatenate -Force`) or configure WinRM over HTTPS (port 5986) on the target, which the tool auto-detects.
 
+## Troubleshooting remote scans
+
+**"WinRM unreachable" even though WinRM is enabled on the target.** The tool reports this when it can't open a TCP connection to ports 5985/5986. Common causes:
+- **Wrong / unroutable address.** A multi-homed target has several IPs — use the one on the same subnet as the machine running the tool, not its hostname (which may resolve to an address you can't route to). Confirm with `Test-NetConnection <target> -Port 5985`.
+- **No listener.** Running the WinRM *service* isn't enough; there must be an HTTP listener on 5985. Run `Enable-PSRemoting -Force` on the target (creates the listener and firewall rule) and verify with `winrm enumerate winrm/config/listener`.
+- A firewall between you and the target blocking 5985/5986.
+
+**"Partial data — WMI hotfixes only" after a successful connection.** The remote scan reached the target, but the accurate WUA scan (which runs as a one-shot SYSTEM scheduled task on the target) didn't complete, so the tool fell back to listing installed hotfixes via WMI — meaning **no "missing" updates** and Install disabled. Common causes:
+- **The scanning account isn't a local administrator on the target** — registering the SYSTEM task requires admin there. Re-scan with **Specify Credentials** using an admin account (a domain account avoids the local-account remote-UAC token filtering that can strip admin rights).
+- **Aggressive endpoint AV/EDR.** Behavioral security products (for example **Webroot SecureAnywhere**) can sandbox or block the task-spawned worker process: the scheduled task appears to run (exit code `0`) but its results never materialize, so the scan falls back to WMI. **Fix: allowlist this tool in your AV/EDR management console.** No client-side change (or change in *how* the tool launches PowerShell) works around a managed AV that is sandboxing the process — the override must come from the AV console. A **code-signed** build makes this a clean publisher-based allowlist.
+
 ## Notes
 
 - Exported CSV and HTML files are excluded from Git via `.gitignore`

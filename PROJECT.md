@@ -102,6 +102,20 @@ A compliance trail and client-facing reports.
 - **ConnectWise Manage integration** — auto-post patch notes/time entries to the matching configuration or open/update a ticket. High workflow value given the MSP context; revisit after fleet support exists.
 - **Scheduling & unattended mode** — a headless `-Unattended -Target -Install -Reboot` mode for off-hours maintenance windows via Task Scheduler, with email/report on completion.
 - **Polish**: real per-update download/install progress (vs. marquee), pre-reboot "who's logged on" check, WSUS-vs-Microsoft-Update source selection, disk-space pre-check.
+- **Remote worker via signed script file instead of `-EncodedCommand`** — bundle with code-signing. Base64 `-EncodedCommand` is a common EDR heuristic trigger; running a dropped, *signed* `.ps1` via `-File` is friendlier to EDRs that flag only the encoded form. (Note: this does **not** help behavioral AVs that sandbox the spawned process regardless of how it's launched — see Known deployment considerations.)
+
+## Toward 1.0 (packaging & trust)
+
+The current batch is the on-ramp to 1.0.0, not 1.0 itself. Graduating out of beta is gated on:
+- **Code-signing** the EXE (the key legitimacy step — earns SmartScreen trust and enables clean publisher-based AV/EDR allowlisting). Ship the signed EXE *as* 1.0.0.
+- **More real-world field testing** of the remote paths (HTTPS/5986 and the WMI fallback have not fired in the field; the credentialed-remote path was only verified to the auth boundary).
+- Optionally the `-EncodedCommand`→signed-script change above.
+
+## Known deployment considerations
+
+From field testing (real client endpoints):
+- **Aggressive endpoint AV/EDR can break remote scans.** Behavioral products such as **Webroot SecureAnywhere** sandbox/block the remote SYSTEM-task worker — the task runs (exit `0`) but its results never materialize, so the scan silently falls back to **partial WMI data** (installed hotfixes only, no "missing"). This is *not* fixable in the tool (no launch technique evades a process-sandboxing AV); it requires **allowlisting the tool in the AV/EDR console**. Code-signing makes that a clean publisher allowlist. Documented in the README's "Troubleshooting remote scans."
+- **Multi-homed targets / addressing.** "WinRM unreachable" despite WinRM being enabled usually means the entered address (often the hostname) resolves to an IP the controller can't route to; use the target's IP on the controller's subnet. Also confirm a listener exists on 5985 (the WinRM *service* running is not sufficient).
 
 ## Non-goals
 
